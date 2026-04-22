@@ -1,0 +1,30 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: gemma-3-270m
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: huggingface
+      args:
+        - --model_name=gemma-3-270m
+        - --model_id=google/gemma-3-270m
+      image: kserve/huggingfaceserver:latest
+      env:
+        - name: VLLM_CPU_KVCACHE_SPACE
+          value: "1"
+        - name: VLLM_ATTENTION_BACKEND
+          value: "CPU_ATTN"
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: huggingface-secret
+              key: token
+      resources:
+        requests:
+          cpu: "4"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
