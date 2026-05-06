@@ -436,6 +436,8 @@ vLLM's architecture is designed for **production GPU serving at scale**, where i
 
 > **Note:** The Qwen2.5-3B benchmark above demonstrates this in practice: vLLM GPU achieved 8.6x higher throughput than llama.cpp CPU. With even larger models (13B+), the GPU advantage grows further as PagedAttention and continuous batching fully utilize GPU parallelism.
 
+<img width="1536" height="1024" alt="Slide 11_2" src="https://github.com/user-attachments/assets/ea1bdd01-ecfd-40ba-b953-af28b55718a3" />
+
 ---
 
 ## Option C: Red Hat OpenShift AI (RHOAI) with GPU
