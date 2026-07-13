@@ -654,6 +654,33 @@ oc delete project vllm-benchmark
   kubectl logs -l serving.kserve.io/inferenceservice=gemma-3-270m -c predictor
   ```
 
+### HuggingFace Xet download crash (SIGSEGV / exit code 139)
+
+Starting with `kserve/huggingfaceserver:v0.19.0+` (which bundles `huggingface_hub` 1.x), the [Xet storage backend](https://huggingface.co/docs/hub/en/xet/using-xet-storage) is enabled by default for model downloads. The Xet native client (`hf-xet`) can cause a **segmentation fault (exit code 139)** on certain CPUs - notably Intel Meteor Lake and other architectures where the Xet binary has [known compatibility issues](https://github.com/huggingface/xet-core/issues/763).
+
+**Symptoms:** The pod enters `CrashLoopBackOff` with exit code 139. Logs stop after `Final IR op priority after setting platform defaults` with no Python traceback (the crash happens in native code during model/tokenizer download).
+
+**Fix:** Add `HF_HUB_DISABLE_XET=1` to the InferenceService env vars to fall back to standard HTTP downloads:
+
+```yaml
+env:
+  - name: HF_HUB_DISABLE_XET
+    value: "1"
+```
+
+### CPU attention backend (`VLLM_ATTENTION_BACKEND`)
+
+The `VLLM_ATTENTION_BACKEND=CPU_ATTN` environment variable was used in older versions to force the CPU attention backend. It has been **deprecated in vLLM 0.13.0** ([PR #26315](https://github.com/vllm-project/vllm/releases)) and replaced by `--attention-config.backend`. In newer versions, vLLM auto-detects the CPU platform and selects the correct backend automatically - no env var is needed.
+
+| KServe image version | Bundled vLLM | `VLLM_ATTENTION_BACKEND` status |
+|----------------------|--------------|-------------------------------|
+| v0.15.x | 0.8.5 | Required for CPU inference |
+| v0.16.0 | 0.9.2 | Supported (last version where it's recognized) |
+| v0.17.0+ | 0.15.1+ | Deprecated (generates warning, auto-detects CPU) |
+| v0.19.0+ / latest | 0.20.0 | Removed (reported as "Unknown", ignored) |
+
+**For v0.16.0 and earlier**, keep `VLLM_ATTENTION_BACKEND=CPU_ATTN` in your manifest. **For v0.17.0+**, remove it - vLLM handles CPU detection automatically.
+
 ### Kind-specific
 
 * Ensure your **Kind cluster is running** before deploying.

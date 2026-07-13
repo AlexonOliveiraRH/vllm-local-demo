@@ -14,8 +14,8 @@ spec:
       env:
         - name: VLLM_CPU_KVCACHE_SPACE
           value: "1"
-        - name: VLLM_ATTENTION_BACKEND
-          value: "CPU_ATTN"
+        - name: HF_HUB_DISABLE_XET
+          value: "1"
         - name: HUGGING_FACE_HUB_TOKEN
           valueFrom:
             secretKeyRef:
