@@ -1,0 +1,43 @@
+# vLLM CUDA ServingRuntime for KServe on RHOAI
+#
+# The image below comes from the RHOAI 2.25 vllm-cuda-runtime-template.
+# To find the correct image for your RHOAI version, run:
+#   oc get template vllm-cuda-runtime-template -n redhat-ods-applications \
+#     -o jsonpath='{.objects[0].spec.containers[0].image}'
+#
+# Alternatively, use the upstream vLLM image (no Red Hat subscription required):
+#   image: vllm/vllm-openai:latest
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: vllm-cuda-runtime
+  annotations:
+    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+    openshift.io/display-name: vLLM NVIDIA GPU ServingRuntime for KServe
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  annotations:
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8080"
+  containers:
+    - name: kserve-container
+      image: registry.redhat.io/rhoai/odh-vllm-cuda-rhel9@sha256:293c6eb7571bd239516a175b1ebbd4e4bc3b1076022d7aaf6b7f16264227aebf
+      command:
+        - python
+        - -m
+        - vllm.entrypoints.openai.api_server
+      args:
+        - --port=8080
+        - --model=/mnt/models
+        - --served-model-name={{.Name}}
+      env:
+        - name: HF_HOME
+          value: /tmp/hf_home
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+  multiModel: false
+  supportedModelFormats:
+    - autoSelect: true
+      name: vLLM

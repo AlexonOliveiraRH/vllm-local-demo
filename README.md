@@ -4,7 +4,7 @@ This project demonstrates deploying and testing LLM inference using **KServe** w
 
 - **[Kind](kind/)** - Lightweight Kubernetes cluster using Podman Desktop
 - **[MicroShift](microshift/)** - Single-node OpenShift (via [minc](https://github.com/minc-org/minc)) for an OpenShift-compatible experience
-- **[Red Hat OpenShift AI (RHOAI)](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai)** - Enterprise OpenShift with GPU support (Tesla T4)
+- **[Red Hat OpenShift AI (RHOAI)](rhoai/)** - Enterprise OpenShift with GPU support (L4, T4, A100, H100)
 
 ---
 
@@ -20,6 +20,13 @@ vllm-local-demo/
 │   ├── 01-install_kserve.sh        # KServe install (step-by-step with SCC grants)
 │   ├── 02-inference-service.yaml   # InferenceService manifest
 │   └── 03-run-inference.sh         # Inference + benchmark script (oc)
+├── rhoai/
+│   ├── 01-setup-project.sh         # Create project, PVC, download model
+│   ├── 02-serving-runtime.yaml     # vLLM CUDA ServingRuntime for KServe
+│   ├── 03-inference-service.yaml   # InferenceService with GPU (RawDeployment)
+│   ├── 04-run-inference.sh         # Inference, benchmark, and metrics (oc)
+│   ├── 05-cleanup.sh               # Remove all resources
+│   └── README.md                   # RHOAI-specific documentation
 ├── llamacpp-bench.sh               # llama.cpp server benchmark script
 └── README.md
 ```
@@ -442,9 +449,21 @@ vLLM's architecture is designed for **production GPU serving at scale**, where i
 
 ## Option C: Red Hat OpenShift AI (RHOAI) with GPU
 
-If you have access to a [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) cluster with NVIDIA GPUs, you can test vLLM in its intended production environment. This section documents how the RHOAI GPU benchmark was performed.
+If you have access to a [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) cluster with NVIDIA GPUs, you can test vLLM in its intended production environment using the scripts and manifests in the [`rhoai/`](rhoai/) directory. See the [RHOAI README](rhoai/README.md) for detailed instructions.
 
-### Prerequisites
+```bash
+cd rhoai/
+./01-setup-project.sh                  # Create project, download model
+oc apply -f 02-serving-runtime.yaml    # Deploy vLLM CUDA runtime
+oc apply -f 03-inference-service.yaml  # Deploy InferenceService with GPU
+oc get pods -w                         # Wait for pod to be ready
+./04-run-inference.sh                  # Run inference
+./04-run-inference.sh benchmark 10 50  # Run benchmark
+```
+
+The section below documents the original RHOAI GPU benchmark results using Gemma-3-270m on a Tesla T4.
+
+### Prerequisites (Gemma-3-270m benchmark)
 
 1. **RHOAI cluster** with KServe and GPU nodes available
 2. **oc CLI** installed and logged in
