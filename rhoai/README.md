@@ -1,326 +1,244 @@
-# vLLM on Red Hat OpenShift AI (RHOAI) with GPU
+# vLLM on Red Hat OpenShift AI
 
-This directory contains scripts and manifests for deploying and benchmarking **vLLM** on **Red Hat OpenShift AI** with NVIDIA GPU acceleration. It demonstrates the full workflow: model download, serving runtime configuration, inference, and performance benchmarking.
-
-While the [Kind](../kind/) and [MicroShift](../microshift/) environments run vLLM on CPU, this setup uses RHOAI's built-in KServe integration with GPU-backed serving runtimes - the way vLLM is designed to run in production.
-
----
-
-## Directory Structure
-
-```
-rhoai/
-├── 01-setup-project.sh          # Create project, PVC, download model
-├── 02-serving-runtime.yaml      # vLLM CUDA ServingRuntime for KServe
-├── 03-inference-service.yaml    # InferenceService with GPU (RawDeployment)
-├── 04-run-inference.sh          # Inference, benchmark, and metrics
-├── 05-cleanup.sh                # Remove all resources
-└── README.md
-```
-
----
+A reproducible GPU inference lab using KServe, a PVC-backed model, and the
+OpenAI-compatible vLLM API. This is an educational lab, not a production security
+or capacity-planning reference. The scripts do not configure public routes,
+authentication policies, autoscaling, or monitoring dashboards.
 
 ## Prerequisites
 
-1. **RHOAI cluster** with the following operators installed and configured:
-   - Red Hat OpenShift AI (with KServe managed)
-   - NVIDIA GPU Operator
-   - OpenShift Serverless (Knative)
-   - OpenShift Service Mesh
+- OpenShift AI with KServe managed and an NVIDIA GPU with capacity available.
+- A storage class with `WaitForFirstConsumer` binding. The script selects the
+  default class; set `STORAGE_CLASS` explicitly if needed. Immediate-binding
+  classes are rejected because they can provision a volume outside the GPU zone.
+  For zonal storage, the download must run in a zone
+  containing a usable GPU. The setup selects the first labeled GPU node's zone;
+  set `STORAGE_ZONE` explicitly when multiple GPU pools exist. On clusters without
+  zone labels, it uses that GPU node's hostname for the download Job.
+- An authenticated `oc` client, Bash, Python 3.9+, and `curl`. Python uses only its
+  standard library. Read access to node labels and the runtime template is needed,
+  in addition to permissions to create projects and namespaced serving resources.
+- Registry access for the selected runtime, and cluster egress to the model hub
+  and Python package index. The download image is UBI Python 3.11 and installs
+  `huggingface_hub==0.34.4`.
 
-2. **At least one GPU node** with an NVIDIA GPU (L4, T4, A100, H100, etc.)
+This configuration uses RawDeployment, not Knative. Follow the prerequisites for
+your installed OpenShift AI release rather than assuming all serving modes require
+the same operators. The supplied configuration targets the 2.25 serving APIs;
+features documented for 3.5 are not automatically available here.
 
-3. **`oc` CLI** installed and logged in as a user with project creation permissions
+### Model license
 
-4. **Tools:** `curl`, `jq`, `bc` (for the benchmark script)
+The default is `Qwen/Qwen2.5-3B-Instruct`, pinned to commit
+`aa8e72537993ba99e69dfaafa59ed015b17504d1`. Its
+[Qwen Research License](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/blob/main/LICENSE)
+grants research/evaluation use and directs commercial users to request a separate
+license. The repository's software license does not relicense model weights.
+Review the selected model's terms before commercial deployment.
 
----
+## Quick start
 
-## Quick Start
-
-```bash
-cd rhoai/
-
-# Step 1: Create the project and download the model
-./01-setup-project.sh
-
-# Step 2: Deploy the vLLM serving runtime
-oc apply -f 02-serving-runtime.yaml
-
-# Step 3: Deploy the InferenceService
-oc apply -f 03-inference-service.yaml
-
-# Step 4: Wait for the model to load (~2-5 min depending on GPU)
-oc get pods -w
-
-# Step 5: Run inference
-./04-run-inference.sh
-
-# Step 6: Run benchmark
-./04-run-inference.sh benchmark 10 50
-```
-
----
-
-## Detailed Steps
-
-### Step 1: Set Up the Project
-
-The setup script creates a Data Science project, provisions a PVC for model storage, and downloads the model weights via a Kubernetes Job.
+Run from this directory after logging in to your own cluster:
 
 ```bash
-# Default: creates project "vllm-demo" with Qwen2.5-3B-Instruct
-./01-setup-project.sh
-
-# Custom project name
-./01-setup-project.sh my-project
-
-# With HuggingFace token (required for gated models like Llama, Gemma)
-HF_TOKEN=hf_xxxxx ./01-setup-project.sh
-
-# Custom model (adjust PVC_SIZE for larger models)
-MODEL_ID=meta-llama/Llama-3.2-3B-Instruct PVC_SIZE=20Gi HF_TOKEN=hf_xxx ./01-setup-project.sh
-```
-
-The model download runs as a Job inside the cluster. For **Qwen2.5-3B-Instruct** (~6.1 GB), expect 5-15 minutes depending on network speed.
-
-### Step 2: Deploy the ServingRuntime
-
-```bash
-oc apply -f 02-serving-runtime.yaml
-```
-
-This creates a vLLM CUDA serving runtime that:
-- Uses the RHOAI-provided vLLM container image with CUDA support
-- Exposes the OpenAI-compatible API on port 8080
-- Publishes Prometheus metrics at `/metrics`
-
-### Step 3: Deploy the InferenceService
-
-```bash
-oc apply -f 03-inference-service.yaml
-```
-
-The InferenceService:
-- Uses **RawDeployment** mode (always running, no cold starts)
-- Requests **1 NVIDIA GPU** with tolerations for GPU node taints
-- Mounts the pre-downloaded model from the PVC
-- Configures vLLM with `--dtype=auto` (auto-detects GPU capabilities)
-- Sets `--max-model-len=4096` and `--enforce-eager` for stability
-
-Wait for the predictor pod to be ready:
-
-```bash
-# Watch pod status
-oc get pods -w
-
-# Check vLLM startup logs
-oc logs -l app=qwen25-3b-predictor -c kserve-container --tail=20
-```
-
-The pod will show `Running 1/1` once vLLM has loaded the model into GPU memory.
-
-### Step 4: Run Inference and Benchmarks
-
-The inference script auto-discovers the predictor pod and sets up port-forwarding:
-
-```bash
-# Single inference request
-./04-run-inference.sh
-
-# Benchmark: 5 concurrent, 10 total (default)
-./04-run-inference.sh benchmark
-
-# Benchmark: 10 concurrent, 50 total
-./04-run-inference.sh benchmark 10 50
-
-# Show vLLM Prometheus metrics
+./00-run-lab.sh up vllm-demo
+export PROJECT=vllm-demo
+./04-run-inference.sh single
+STREAM=1 RESULTS_FILE=benchmark-c4.json ./04-run-inference.sh benchmark 4 32
 ./04-run-inference.sh metrics
+MAX_TOKENS=64 ./04-run-inference.sh prefix
 ```
 
-You can also send requests directly via `curl`:
+`up` downloads the model, resolves the runtime image from the installed RHOAI
+template, deploys, waits for model health, and runs one validated inference. It
+leaves the lab running. First-time download and image pulls can take many minutes;
+prepare the lab before a live demonstration.
+
+`RESULTS_FILE` is optional and must not already exist. JSON output includes
+per-request status, actual token counts, errors, and timing. Keep raw evidence
+outside version control unless it has been reviewed for sensitive prompts and
+generated content. Credentials and endpoint URLs are not included in successful
+result records.
+
+### Fully automated lifecycle check
 
 ```bash
-# Port-forward to the predictor pod
-POD=$(oc get pod -l app=qwen25-3b-predictor -o name)
-oc port-forward $POD 8080:8080 &
-
-# Chat completion
-curl -s http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen25-3b",
-    "messages": [{"role": "user", "content": "What is PagedAttention?"}],
-    "max_tokens": 100,
-    "temperature": 0.7
-  }' | jq .
-
-# List models
-curl -s http://localhost:8080/v1/models | jq .
-
-# Prometheus metrics
-curl -s http://localhost:8080/metrics | grep "vllm:"
+./00-run-lab.sh verify vllm-lifecycle-check
 ```
 
-### Step 5: Clean Up
+`verify` exclusively creates a new project and refuses an existing one. It runs setup, deployment, readiness, single
+inference, a concurrent benchmark, metrics, and a prefix-cache experiment, then
+deletes only that verification project, using its UID as a server-side deletion
+precondition. A recreated project with the same name is not deleted. A failing step exits nonzero and leaves
+resources for inspection. A printed lifecycle pass means all commands succeeded;
+it is not a performance superiority or production-readiness certification.
+
+## Files and manual workflow
+
+- `00-run-lab.sh`: orchestration (`up` or disposable `verify`).
+- `01-setup-project.sh`: project, annotated PVC, immutable model download.
+- `02-serving-runtime.yaml`: runtime image, API process, environment, health probes.
+- `03-inference-service.yaml`: references that runtime and `pvc://model-pvc/`.
+- `04-run-inference.sh`: readiness and owned port-forward, then the Python client.
+- `inference_client.py`: response validation, streaming timing, JSON evidence.
+- `05-cleanup.sh`: confirmed project deletion, with errors propagated.
+- `tests/`: HTTP fixtures and shell regressions; no cluster needed.
+
+For individual steps:
 
 ```bash
-./05-cleanup.sh
+./01-setup-project.sh vllm-demo
+oc project vllm-demo
+# Inspect the compatible image for your installed release:
+oc get template vllm-cuda-runtime-template -n redhat-ods-applications \
+  -o jsonpath='{.objects[0].spec.containers[0].image}'
+# Update the image in 02-serving-runtime.yaml if necessary.
+oc apply -f 02-serving-runtime.yaml
+oc apply -f 03-inference-service.yaml
+oc wait --for=condition=Ready inferenceservice/qwen25-3b --timeout=1200s
+oc logs -l serving.kserve.io/inferenceservice=qwen25-3b -c kserve-container
+PROJECT=vllm-demo ./04-run-inference.sh
 ```
 
----
+The model specification uses `predictor.model.runtime: vllm-cuda-runtime`; it is
+not a separate custom-container predictor. KServe mounts the PVC in the model
+container. Readiness is based on `/health`, not merely the Pod's `Running` phase.
+The client connects through a short-lived local port-forward to the predictor
+Pod selected by its Ready condition. This bypasses an external ingress route and
+is not a route/auth test.
 
-## Customization
+## Measurement and a practical demo
 
-### Using a Different Model
+1. Show the runtime reference, GPU allocation, and a successful completion.
+2. Compare concurrency 1, 4, 8, and 16 on the **same** model, runtime, GPU, and
+   workload. Record both throughput and latency rather than choosing one winner.
+3. Run the long-prefix experiment; compare cold/warm TTFT and cache-hit deltas.
+4. Explain which operational capabilities are provided by the platform, separately
+   from which engine optimizations were actually observed.
 
-Edit `03-inference-service.yaml` to change the model name and tune resources:
+Example sweep (use a fresh output directory; three repetitions per point):
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `--served-model-name` | `qwen25-3b` | Model name exposed via API |
-| `--dtype` | `auto` | Use `half` for T4 GPUs (no BF16 support) |
-| `--max-model-len` | `4096` | Context window size (affects KV cache memory) |
-| `--enforce-eager` | enabled | Disables CUDA graph compilation (more stable) |
-| `nvidia.com/gpu` | `1` | Increase for tensor parallelism with `--tensor-parallel-size` |
+```bash
+mkdir benchmark-results
+for repeat in 1 2 3; do
+  for concurrency in 1 4 8 16; do
+    STREAM=1 IGNORE_EOS=1 MAX_TOKENS=128 \
+      RESULTS_FILE="benchmark-results/c${concurrency}-r${repeat}.json" \
+      ./04-run-inference.sh benchmark "$concurrency" 32
+  done
+done
+```
 
-Also update `01-setup-project.sh` with `MODEL_ID` and `PVC_SIZE` environment variables.
+The client performs two excluded warmup requests by default. `MAX_TOKENS` is
+normally a ceiling; `IGNORE_EOS=1` is a vLLM extension for fixed-length synthetic
+tests. The repeated default prompt is intentionally simple and can benefit from
+prefix caching. It is not a representative production dataset. Use varied,
+versioned prompts and controlled cache policy when comparing engines.
 
-### GPU-Specific Notes
+Measurements:
 
-| GPU | Compute | VRAM | `--dtype` | Notes |
-|-----|---------|------|-----------|-------|
-| **L4** | 8.9 | 24 GB | `auto` (BF16) | Good for models up to ~7B FP16 |
-| **T4** | 7.5 | 16 GB | `half` (FP16) | No BF16 support |
-| **A100** | 8.0 | 40/80 GB | `auto` (BF16) | Production standard |
-| **H100** | 9.0 | 80 GB | `auto` (BF16/FP8) | Highest throughput |
+- Successful requests/s and actual output tokens/s use the full measured wall time.
+- Non-streaming latency includes the full response; it is **not TTFT**.
+- `STREAM=1` reports client-observed time to first nonempty text chunk. TPOT is an
+  estimate from first-to-last text time and the server's generated token count;
+  network buffering and chunking affect it. It is not a per-token ITL trace.
+- p50/p95/p99 use nearest-rank percentiles over successful requests. Small samples
+  do not support reliable tail-latency or SLO conclusions.
+- HTTP errors, malformed responses, missing usage, incomplete streams, and
+  transport failures are failures, not successful throughput.
+- Prometheus `*_tokens_total` values are counters. Use `rate()` over a suitable
+  interval for tokens/s. An idle cache snapshot is not a utilization benchmark.
 
-### Multi-GPU (Tensor Parallelism)
+`prefix` uses a unique, long repeated prefix with two sequential streaming
+requests. It reports `cache_reuse_observed` and server counter deltas. The counters
+are shared; avoid other traffic. Two timings illustrate behavior but do not prove
+a statistically significant speedup. Caching reuses full token blocks and can
+work with the completions API; a very short prompt may have no reusable block.
 
-For models that don't fit on a single GPU, add tensor parallelism:
+For sustained workloads and quality assessment, use
+[GuideLLM](https://github.com/vllm-project/guidellm) and
+[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness).
+Compare engines on matched hardware, precision, model revision, tokenizer,
+prompt/output lengths, cache state, concurrency, and transport. Retain errors,
+warmup policy, repeated measurements, software versions, and raw data. Never
+attribute a GPU-versus-CPU configuration difference solely to the engine.
+
+## Configuration
+
+- Setup: positional project name; `MODEL_ID`, immutable `MODEL_REVISION`,
+  `PVC_SIZE` (default 10Gi), `HF_TOKEN` for gated models, `STORAGE_CLASS`, `STORAGE_ZONE`, and
+  `DOWNLOAD_TIMEOUT` (default 1800s).
+  `DOWNLOAD_IMAGE` can pin a compatible UBI Python 3.11 image digest; the default
+  image tag follows UBI updates. Record resolved image digests with your evidence.
+- Deployment: `VLLM_IMAGE` overrides installed-template image resolution in `up`.
+  Check model/runtime/hardware support for the specific downstream release.
+- Client: `PROJECT`, `MODEL_NAME`, `INGRESS_PORT` (8080), `READY_TIMEOUT`,
+  `BASE_URL`, `API_KEY`, `REQUEST_TIMEOUT` (120 seconds), `PROMPT`, `MAX_TOKENS`,
+  `STREAM`, `IGNORE_EOS`, `WARMUP_REQUESTS`, `RESULTS_FILE`.
+
+`BASE_URL` skips cluster access and port-forwarding, allowing an existing secured
+endpoint. TLS verification stays enabled; `API_KEY` supplies a bearer token.
+The local port-forward is bound to loopback and only its own child process is
+stopped. Do not expose unauthenticated inference or metrics publicly.
+`BASE_URL` and `RESULTS_FILE` are rejected by `00-run-lab.sh`; they belong to
+individual client invocations, not the self-contained lifecycle check.
+
+Setup records model identity on the PVC and model/revision/PVC UID on the download
+Job. A missing PVC, mismatched Job, or unrecorded identity cannot be treated as
+a completed download. Use a new project to change models without mixing files. Rerunning
+while a download is active waits for it; it does not delete the Job. A failed Job
+is preserved for diagnosis. Change the model alias and resource settings in the
+manifests when adapting the lab to another model.
+
+### Precision and multiple GPUs
+
+`--dtype=auto` follows the model configuration; it does not automatically quantize
+to FP8 or guarantee compatibility with every GPU. Use `--dtype=half` on T4 for
+this BF16 model. `--enforce-eager` disables CUDA-graph execution; it is not a
+general fix for every Triton or filesystem issue. Writable cache directories are
+configured separately. Removing eager mode changes the benchmark configuration.
+
+For tensor parallelism, append `--tensor-parallel-size=2` to `predictor.model.args`
+and change **both** GPU resource values:
 
 ```yaml
-# In 03-inference-service.yaml
-args:
-  - --tensor-parallel-size=2
 resources:
+  requests:
+    nvidia.com/gpu: "2"
   limits:
     nvidia.com/gpu: "2"
 ```
 
-### Serverless Mode (Scale to Zero)
+Preserve the CPU/memory settings. Matching GPUs and topology must be available.
+A single-GPU node may not have capacity for surge Pods during an update; plan an
+explicit maintenance/redeployment strategy. Serverless, KEDA, distributed serving,
+and canary rollout need release-specific configuration and are outside this lab.
 
-Replace `RawDeployment` with Knative Serverless by removing the deployment mode annotation:
-
-```yaml
-# Remove these annotations:
-#   serving.kserve.io/deploymentMode: RawDeployment
-#   serving.kserve.io/disableStorageInitializer: "true"
-```
-
-Note: Serverless mode adds cold start latency (~30-60s) when scaling from zero.
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                  RHOAI Cluster                       │
-│                                                      │
-│  ┌──────────┐    ┌───────────┐    ┌───────────────┐  │
-│  │  Client   │───>│  KServe   │───>│ vLLM Runtime  │  │
-│  │(curl/SDK) │    │ (routing) │    │  (GPU pod)    │  │
-│  └──────────┘    └───────────┘    │               │  │
-│                                    │ ┌───────────┐ │  │
-│                                    │ │ NVIDIA GPU │ │  │
-│                                    │ │  (L4/T4/   │ │  │
-│                                    │ │  A100/H100)│ │  │
-│                                    │ └───────────┘ │  │
-│                                    │ ┌───────────┐ │  │
-│                                    │ │ Model PVC  │ │  │
-│                                    │ │ (weights)  │ │  │
-│                                    │ └───────────┘ │  │
-│                                    └───────────────┘  │
-│                                                      │
-│  Endpoints:                                          │
-│    /v1/chat/completions  - Chat API                  │
-│    /v1/completions       - Text completions          │
-│    /v1/models            - List models               │
-│    /metrics              - Prometheus metrics        │
-└──────────────────────────────────────────────────────┘
-```
-
----
-
-## Deployment Notes
-
-| Topic | Details |
-|-------|---------|
-| **GPU taints** | GPU nodes may have taints like `nvidia.com/gpu`. The InferenceService includes `tolerations` with `operator: Exists` to schedule on any GPU node. |
-| **`--enforce-eager`** | Avoids Triton compilation issues with OpenShift's restricted filesystem. Can be removed in permissive environments for better performance. |
-| **`HOME=/tmp`** | OpenShift runs containers as non-root with a random UID. `HOME`, `HF_HOME`, and `TRITON_CACHE_DIR` must point to writable directories. |
-| **Storage initializer** | Disabled via annotation (`serving.kserve.io/disableStorageInitializer: "true"`) because the model is pre-downloaded to a PVC. This avoids init container authentication issues. |
-| **RawDeployment mode** | Bypasses Knative Serving for simpler routing and no scale-to-zero behavior. Ideal for demos and dedicated GPU workloads. |
-| **Image pull** | The RHOAI vLLM image is hosted on `registry.redhat.io` and requires an active pull secret (automatically configured on RHOAI clusters). |
-
----
-
-## Troubleshooting
-
-### Pod stays in `Pending`
-
-Check if the GPU node has capacity:
+## Troubleshooting and cleanup
 
 ```bash
-oc describe node -l nvidia.com/gpu.present=true | grep -A5 "Allocated resources"
+oc get pods,pvc,jobs -n vllm-demo
+oc get events -n vllm-demo --sort-by=.lastTimestamp
+oc logs job/download-model -n vllm-demo --tail=30
+oc logs -n vllm-demo -l serving.kserve.io/inferenceservice=qwen25-3b \
+  -c kserve-container --tail=50
+./05-cleanup.sh vllm-demo
 ```
 
-### Pod stays in `ContainerCreating`
+Check GPU availability and PVC topology for Pending Pods; registry credentials
+for image-pull failures; model license/token and network access for download
+failures. A download timeout does not delete its Job. Increase `DOWNLOAD_TIMEOUT`
+and rerun after inspecting its status. Cleanup asks for confirmation and deletes
+the selected project, including model storage according to its reclaim policy.
 
-The vLLM image is large (~14 GB). First pull can take 2-5 minutes. Check events:
-
-```bash
-oc get events --sort-by='.lastTimestamp' | tail -10
-```
-
-### `ErrImagePull`
-
-Verify the cluster has a valid pull secret for `registry.redhat.io`:
-
-```bash
-oc get secret -n openshift-config pull-secret
-```
-
-### vLLM fails to start (OOM or CUDA errors)
-
-Check the container logs:
-
-```bash
-oc logs -l app=qwen25-3b-predictor -c kserve-container
-```
-
-Common fixes:
-- **OOM:** Reduce `--max-model-len` or use a quantized model
-- **CUDA error:** Ensure `--dtype=half` for T4 GPUs (no BF16 support)
-- **Triton errors:** Add `--enforce-eager` to skip CUDA graph compilation
-
-### HuggingFace download fails
-
-For gated models, ensure the HuggingFace token secret exists and has accepted the model's license:
-
-```bash
-oc get secret huggingface-secret
-```
-
-For Xet download crashes (exit code 139), set `HF_HUB_DISABLE_XET=1` in the download job.
-
----
+Run local tests with `python3 -m unittest discover -s tests -v`. They use loopback
+HTTP and controlled command fixtures, not cluster credentials. A clean local test
+run does not replace the disposable lifecycle check.
 
 ## References
 
-- [vLLM Documentation](https://docs.vllm.ai/)
-- [Red Hat OpenShift AI Documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/)
-- [KServe Documentation](https://kserve.github.io/website/)
-- [Qwen2.5-3B-Instruct Model](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
-- [Red Hat AI Validated Models](https://docs.redhat.com/en/documentation/red_hat_ai/3/html-single/validated_models/index)
+- [vLLM serving arguments, version 0.10.1](https://docs.vllm.ai/en/v0.10.1/cli/serve.html)
+- [vLLM prefix-cache design](https://docs.vllm.ai/en/v0.10.1/design/prefix_caching.html)
+- [OpenShift AI documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed)
+- [KServe documentation](https://kserve.github.io/website/)
+- [Kubernetes GPU resource requirements](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)

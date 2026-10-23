@@ -3,6 +3,7 @@
 # Usage:
 #   ./05-cleanup.sh                  # delete all resources in the project
 #   ./05-cleanup.sh my-project       # specify project name
+set -euo pipefail
 
 PROJECT=${1:-vllm-demo}
 
@@ -18,12 +19,18 @@ read -p "Are you sure you want to delete project '$PROJECT'? (y/N) " -n 1 -r
 echo ""
 
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    # Kill any port-forward processes
-    pkill -f "port-forward.*qwen25-3b" 2>/dev/null && \
-        printf "➡️ Stopped port-forward processes\n" || true
-
+    # Each inference invocation owns and stops its own port-forward process.
+    # Never kill unrelated forwarding sessions or infer a different project.
     printf "➡️ Deleting project ${YELLOW}%s${NC}...\n" "$PROJECT"
-    oc delete project "$PROJECT" --wait=true
+    if [[ -n ${EXPECTED_PROJECT_UID:-} ]]; then
+        # A UID precondition makes deletion safe even if the name was recreated.
+        export EXPECTED_PROJECT_UID
+        python3 -c 'import json,os; print(json.dumps({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":os.environ["EXPECTED_PROJECT_UID"]}}))' |
+            oc delete --raw "/api/v1/namespaces/${PROJECT}" -f - >/dev/null
+        oc wait --for=delete "namespace/${PROJECT}" --timeout=600s
+    else
+        oc delete project "$PROJECT" --wait=true
+    fi
 
     printf "\n✅ ${GREEN}Cleanup complete!${NC}\n\n"
 else

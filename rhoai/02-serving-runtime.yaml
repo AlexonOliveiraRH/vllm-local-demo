@@ -32,11 +32,32 @@ spec:
         - --model=/mnt/models
         - --served-model-name={{.Name}}
       env:
+        - name: HOME
+          value: /tmp
         - name: HF_HOME
           value: /tmp/hf_home
+        - name: TRITON_CACHE_DIR
+          value: /tmp/.triton
       ports:
         - containerPort: 8080
           protocol: TCP
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 10
+        failureThreshold: 120
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 10
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 30
+        failureThreshold: 3
   multiModel: false
   supportedModelFormats:
     - autoSelect: true

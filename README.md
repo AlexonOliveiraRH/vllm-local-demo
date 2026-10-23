@@ -1,10 +1,10 @@
 # vLLM + KServe Demo
 
-This project demonstrates deploying and testing LLM inference using **KServe** with **vLLM** as the runtime. Benchmarked models include **[Gemma-3-270m](https://huggingface.co/google/gemma-3-270m)** (270M params) and **[Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)** (3.4B params). Three environments are supported:
+This project demonstrates deploying and testing LLM inference using **KServe** with **vLLM** as the runtime. Benchmarked models include **[Gemma-3-270m](https://huggingface.co/google/gemma-3-270m)** (270M params) and **[Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)** (3.09B params). Three deployment examples are provided:
 
 - **[Kind](kind/)** - Lightweight Kubernetes cluster using Podman Desktop
 - **[MicroShift](microshift/)** - Single-node OpenShift (via [minc](https://github.com/minc-org/minc)) for an OpenShift-compatible experience
-- **[Red Hat OpenShift AI (RHOAI)](rhoai/)** - Enterprise OpenShift with GPU support (L4, T4, A100, H100)
+- **[Red Hat OpenShift AI (RHOAI)](rhoai/)** - GPU-serving lab; check runtime, model and hardware compatibility for your installed release
 
 ---
 
@@ -21,11 +21,14 @@ vllm-local-demo/
 │   ├── 02-inference-service.yaml   # InferenceService manifest
 │   └── 03-run-inference.sh         # Inference + benchmark script (oc)
 ├── rhoai/
+│   ├── 00-run-lab.sh               # Prepare a lab or verify its full lifecycle
 │   ├── 01-setup-project.sh         # Create project, PVC, download model
 │   ├── 02-serving-runtime.yaml     # vLLM CUDA ServingRuntime for KServe
 │   ├── 03-inference-service.yaml   # InferenceService with GPU (RawDeployment)
-│   ├── 04-run-inference.sh         # Inference, benchmark, and metrics (oc)
+│   ├── 04-run-inference.sh         # Validated inference, benchmark, metrics, prefix
+│   ├── inference_client.py        # Token counts, timing and per-request evidence
 │   ├── 05-cleanup.sh               # Remove all resources
+│   ├── tests/                     # Isolated HTTP and command regression tests
 │   └── README.md                   # RHOAI-specific documentation
 ├── llamacpp-bench.sh               # llama.cpp server benchmark script
 └── README.md
@@ -353,6 +356,13 @@ With either server running:
 
 All tests used identical request parameters (prompt: *"Being an IT professional is"*, max 30 tokens, stop on `.`). Local tests ran on the same machine (CPU-only, no NVIDIA GPU). The RHOAI tests ran on an OpenShift cluster in AWS with a Tesla T4 GPU.
 
+**Historical exploratory results, not a controlled engine comparison.** These
+tables used different hardware, precisions, runtime versions, and serving paths.
+The original timing-only harness did not retain HTTP status, response validity,
+or actual output-token counts for each request. Treat the values as recorded
+observations, not verified successful-throughput or causal performance evidence.
+Use the failure-aware [`rhoai/`](rhoai/) workflow for new measurements.
+
 ### Gemma-3-270m Results (10 concurrent, 50 requests)
 
 | # | Runtime | Precision | Hardware | Cores | Throughput | Wall Clock | Latency (min/max) |
@@ -370,24 +380,35 @@ All tests used identical request parameters (prompt: *"Being an IT professional 
 
 ### Qwen2.5-3B-Instruct Results (10 concurrent, 50 requests)
 
-To validate the GPU advantage with a larger model, the same benchmark was repeated using **[Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)** (3.4B parameters, 5.8 GiB in FP16) - a model 12.5x larger than Gemma-3-270m:
+The exploratory benchmark also used **[Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)** (3.09B parameters, 5.8 GiB in FP16). Hardware and serving configuration differed between the following runs:
 
 | # | Runtime | Precision | Hardware | Cores | Throughput | Wall Clock | Latency (min/max) |
 |---|---------|-----------|----------|-------|------------|------------|-------------------|
 | 1 | **vLLM** (RHOAI GPU) | FP16 | **Tesla T4 16GB** | 4 + GPU | **8.6 req/s** | **5.76s** | **0.60s / 1.37s** |
 | 2 | **llama.cpp pure** (b8892) | F16 | CPU (bare metal) | 4 | 1.0 req/s | 47.63s | 3.52s / 4.94s |
 
-**GPU advantage: 8.6x throughput, 8.3x faster wall clock time.** With the larger model, vLLM on a Tesla T4 delivered 8.6 requests/second while llama.cpp on CPU managed only 1.0 req/s. The GPU was also *faster* with the 3B model (8.6 req/s) than with the 270M model (6.3 req/s), because larger models better utilize GPU batch parallelism through continuous batching.
+The recorded wall times differ by about 8.3x (47.63 / 5.76). Dividing the displayed,
+truncated request rates gives a different ratio and should not be used as an
+independent speedup measurement. These runs compare complete configurations, not
+the engines on matched hardware. They do not isolate the effect of model size,
+PagedAttention, or continuous batching.
 
 ### Key Takeaways
 
-**Model size determines the GPU advantage.** With the tiny 270M model, llama.cpp on CPU was faster than vLLM on GPU (9.4 vs 6.3 req/s). With the 3B model, the roles reversed dramatically: vLLM GPU was 8.6x faster. This confirms that vLLM's GPU optimizations (PagedAttention, continuous batching) only pay off when the model is large enough to benefit from GPU memory management.
+**Workload and configuration matter.** Model size alone does not determine which
+engine is faster. Compare the same hardware, precision, request lengths, cache
+policy, and concurrency before attributing a difference to an engine feature.
 
-**vLLM GPU stands out for latency consistency.** The vLLM GPU results show remarkably consistent latency under load: **0.60s-1.37s** (3B model) and **1.44s-1.64s** (270M model) across all 50 requests. Every other runtime showed significant latency variance under concurrency.
+**Latency needs a distribution.** The recorded minimum and maximum are not enough
+to establish near-constant latency or an SLO. Retain successful request counts,
+p50/p95/p99, throughput, and repeated runs under a representative workload.
 
-**vLLM scales with CPU cores.** On the RHOAI cluster, going from 4 to 8 CPU cores improved throughput from 1.1 to 3.7 req/s (3.4x improvement), approaching ramalama CPU performance levels.
+The historical CPU configurations reported different timings; those observations
+need repetition with validated responses before drawing scaling conclusions.
 
-**With a tiny model (270M), this is vLLM's worst case.** The model fits entirely in CPU cache, so vLLM's GPU memory optimizations provide no benefit. The 3B model results show the true picture for production workloads.
+PagedAttention manages attention KV-cache blocks. Its usefulness depends on the
+serving workload; it is not limited to models whose weights exceed GPU memory,
+and it does not guarantee freedom from out-of-memory errors.
 
 ### Kind vs MicroShift (vLLM only)
 
@@ -409,39 +430,47 @@ To validate the GPU advantage with a larger model, the same benchmark was repeat
 | Wall Clock Time | 41.32s | 29.53s |
 | Throughput | 1.2 req/s | 1.6 req/s |
 
-### Why llama.cpp Wins on Local/CPU
+### Interpreting local and cluster results
 
-These results reflect a **worst-case scenario for vLLM** and a **best-case scenario for llama.cpp**:
+Several variables differ between these exploratory configurations:
 
-1. **No NVIDIA GPU** - vLLM is built on PyTorch + CUDA. Without a GPU, it falls back to CPU inference and loses its primary advantage (PagedAttention, GPU memory management, tensor parallelism).
+1. **Hardware and backend** - CPU and GPU execution use different builds and kernels. vLLM CPU installation is an explicit supported-backend choice, not a universal transparent CUDA fallback.
 
-2. **Container overhead** - vLLM runs inside a Kubernetes pod behind Istio/Knative routing layers. Each request passes through: client -> port-forward -> Istio gateway -> Knative activator -> vLLM container. llama.cpp runs as a bare-metal process with direct socket access.
+2. **Transport and deployment** - Local Kubernetes, serverless, and direct
+   serving can use different network paths. Verify the path for each run before
+   attributing latency to a gateway or activator. The current RHOAI lab forwards
+   directly to a Ready predictor Pod and does not benchmark an external route.
 
-3. **Small model** - Gemma-3-270m (540MB in FP16) fits entirely in CPU cache. vLLM's memory optimizations (PagedAttention, KV cache paging) provide no benefit at this scale - they are designed for models that exceed GPU VRAM.
+3. **Model and request size** - Weight size, prompt length, generated-token count, and concurrency affect the balance of compute, memory, and scheduling costs. The measurements do not establish that the model fits in CPU hardware cache or that KV-cache management has no benefit.
 
-4. **llama.cpp's CPU optimizations** - llama.cpp is written in C/C++ with hand-tuned SIMD kernels (AVX2, AVX-512, VNNI) that directly target the CPU's instruction set. vLLM uses PyTorch's general-purpose CPU backend, which carries significant overhead for small models.
+4. **Kernel implementations** - Both projects have backend-specific optimizations. Attribute an observed difference to a particular kernel or overhead only with profiling evidence.
 
-5. **Pure llama.cpp vs ramalama** - The pure build (b8892) is 2.2x faster than ramalama's bundled version (b1-75f3bc9) due to a newer llama.cpp version, `kv_unified=false` (better memory layout), and optimized per-slot context allocation.
+5. **Version and launch settings** - The llama.cpp and ramalama runs used different builds and launch settings. Their separate contributions were not isolated.
 
 ### Where vLLM Shines
 
-vLLM's architecture is designed for **production GPU serving at scale**, where it significantly outperforms llama.cpp:
+vLLM is a useful option for high-concurrency serving. Selection should be based on
+your workload and operational requirements, not a universal ranking. The
+[llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+also documents GPU execution, continuous batching, monitoring, and speculative
+decoding. Compare the exact versions being deployed.
 
 | Capability | vLLM | llama.cpp |
 |------------|------|-----------|
-| **GPU inference (NVIDIA)** | Native CUDA, tensor parallelism across multiple GPUs | Limited GPU support (Vulkan, some CUDA) |
-| **Large models (7B-405B)** | PagedAttention manages GPU VRAM efficiently, no OOM | Must fit entirely in memory or use manual layer splitting |
-| **Continuous batching** | Dynamic batching across hundreds of concurrent requests | Fixed slot count, limited parallelism |
-| **Latency consistency** | Near-constant latency under load (see GPU results above) | Latency varies significantly with concurrency |
-| **Production features** | LoRA hot-swap, speculative decoding, prefix caching | Basic serving |
-| **Kubernetes integration** | KServe: autoscaling, canary rollouts, model versioning, A/B testing | Manual deployment |
-| **Multi-model serving** | Multiple LoRA adapters on a single base model | One model per server instance |
+| **GPU inference** | Multiple accelerator backends and parallelism strategies | CUDA and other backends; CPU/GPU hybrid options |
+| **Memory management** | Paged KV cache; capacity still depends on weights, activations, and requests | GGUF formats, quantization, and configurable CPU/GPU placement |
+| **Batching** | Continuous batching with configurable scheduler limits | Continuous batching with configurable slots |
+| **Latency** | Must be measured against a workload and SLO | Must be measured against the same workload and SLO |
+| **Serving features** | Prefix caching, speculative decoding, adapters; version/model dependent | Prompt reuse, speculative decoding, monitoring; version/model dependent |
+| **Platform integration** | Packaged runtimes in platforms such as KServe/OpenShift AI | Can be containerized; integration and support must be evaluated separately |
 
-**Rule of thumb:**
-- **Local development, edge, CPU, or single-user** -> llama.cpp
-- **Production, GPU cluster, multi-user, enterprise** -> vLLM + KServe
+**Evaluation starting points:** llama.cpp is worth testing for local, edge and
+CPU/GPU-hybrid workloads; vLLM with KServe is worth testing for managed,
+concurrent GPU serving. Neither is an exclusive category or an automatic winner.
 
-> **Note:** The Qwen2.5-3B benchmark above demonstrates this in practice: vLLM GPU achieved 8.6x higher throughput than llama.cpp CPU. With even larger models (13B+), the GPU advantage grows further as PagedAttention and continuous batching fully utilize GPU parallelism.
+> **Note:** The historical GPU/CPU comparison does not establish how either
+> engine would perform on matched hardware, nor predict a speedup for larger
+> models. Use a controlled benchmark and quality evaluation for that decision.
 
 <img width="1536" height="1024" alt="Slide 11_2" src="https://github.com/user-attachments/assets/ea1bdd01-ecfd-40ba-b953-af28b55718a3" />
 
@@ -449,205 +478,44 @@ vLLM's architecture is designed for **production GPU serving at scale**, where i
 
 ## Option C: Red Hat OpenShift AI (RHOAI) with GPU
 
-If you have access to a [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) cluster with NVIDIA GPUs, you can test vLLM in its intended production environment using the scripts and manifests in the [`rhoai/`](rhoai/) directory. See the [RHOAI README](rhoai/README.md) for detailed instructions.
+The [RHOAI lab](rhoai/README.md) uses KServe, a versioned vLLM runtime, and a
+PVC-backed Qwen2.5-3B-Instruct model. This is an educational GPU-serving lab, not
+a production security or capacity-planning reference. Model licenses and
+supported runtime/hardware combinations must be checked independently.
 
 ```bash
 cd rhoai/
-./01-setup-project.sh                  # Create project, download model
-oc apply -f 02-serving-runtime.yaml    # Deploy vLLM CUDA runtime
-oc apply -f 03-inference-service.yaml  # Deploy InferenceService with GPU
-oc get pods -w                         # Wait for pod to be ready
-./04-run-inference.sh                  # Run inference
-./04-run-inference.sh benchmark 10 50  # Run benchmark
+./00-run-lab.sh up vllm-demo
+export PROJECT=vllm-demo
+./04-run-inference.sh single
+STREAM=1 ./04-run-inference.sh benchmark 4 12
+./04-run-inference.sh prefix
+./04-run-inference.sh metrics
 ```
 
-The section below documents the original RHOAI GPU benchmark results using Gemma-3-270m on a Tesla T4.
+The orchestrator resolves the installed runtime image and waits for model
+readiness. The client validates responses and records actual token counts.
+Non-streaming latency is not TTFT; use streaming for client-observed first-text
+timing. Compare throughput and latency on matched hardware and workloads.
 
-### Prerequisites (Gemma-3-270m benchmark)
-
-1. **RHOAI cluster** with KServe and GPU nodes available
-2. **oc CLI** installed and logged in
-3. **Hugging Face token** with access to [google/gemma-3-270m](https://huggingface.co/google/gemma-3-270m)
-
-### Step 1: Create a Project
+For a disposable end-to-end test, use a **new** project name:
 
 ```bash
-oc new-project vllm-benchmark
+./00-run-lab.sh verify vllm-lifecycle-check
 ```
 
-### Step 2: Download the Model via a Job
-
-Since KServe's storage initializer may not have access to your HuggingFace token (it requires ClusterStorageContainer configuration), download the model to a PVC using a Job:
+This creates its own project, downloads the model, deploys, runs all client modes,
+and deletes the project only after successful checks. A failure preserves
+resources for inspection. For a retained lab, cleanup asks for confirmation:
 
 ```bash
-# Create HuggingFace secret
-oc create secret generic huggingface-secret --from-literal=token=<your_token>
-
-# Create PVC for model storage
-cat <<EOF | oc apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: gemma-model-pvc
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi
-EOF
-
-# Download the model
-cat <<'EOF' | oc apply -f -
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: download-model
-spec:
-  template:
-    spec:
-      containers:
-        - name: downloader
-          image: registry.access.redhat.com/ubi9/python-311:latest
-          command:
-            - bash
-            - -c
-            - |
-              pip install -q huggingface_hub && \
-              python -c "
-              from huggingface_hub import snapshot_download
-              snapshot_download(
-                  'google/gemma-3-270m',
-                  local_dir='/mnt/models',
-                  token='$(cat /secret/token)'
-              )
-              print('Download complete!')
-              "
-          volumeMounts:
-            - name: model-storage
-              mountPath: /mnt/models
-            - name: hf-token
-              mountPath: /secret
-              readOnly: true
-          resources:
-            requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
-      volumes:
-        - name: model-storage
-          persistentVolumeClaim:
-            claimName: gemma-model-pvc
-        - name: hf-token
-          secret:
-            secretName: huggingface-secret
-      restartPolicy: Never
-  backoffLimit: 2
-EOF
-
-# Wait for download to complete
-oc get pods -w
+./05-cleanup.sh vllm-demo
 ```
 
-### Step 3: Deploy vLLM with GPU
-
-```bash
-cat <<'EOF' | oc apply -f -
-apiVersion: serving.kserve.io/v1beta1
-kind: InferenceService
-metadata:
-  name: gemma-3-270m-gpu
-  annotations:
-    serving.kserve.io/deploymentMode: RawDeployment
-    serving.kserve.io/disableStorageInitializer: "true"
-spec:
-  predictor:
-    tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
-    containers:
-      - name: kserve-container
-        image: vllm/vllm-openai:v0.8.5
-        args:
-          - --port=8080
-          - --model=/mnt/models
-          - --served-model-name=gemma-3-270m
-          - --dtype=half
-          - --enforce-eager
-        env:
-          - name: HOME
-            value: /tmp
-          - name: TRITON_CACHE_DIR
-            value: /tmp/.triton
-        ports:
-          - containerPort: 8080
-            protocol: TCP
-        volumeMounts:
-          - name: model-storage
-            mountPath: /mnt/models
-            readOnly: true
-        resources:
-          requests:
-            cpu: "4"
-            memory: "8Gi"
-            nvidia.com/gpu: "1"
-          limits:
-            cpu: "8"
-            memory: "16Gi"
-            nvidia.com/gpu: "1"
-    volumes:
-      - name: model-storage
-        persistentVolumeClaim:
-          claimName: gemma-model-pvc
-EOF
-```
-
-> **Note:** If the cluster uses a MachineAutoscaler for GPU nodes, the first deploy may take up to 15 minutes while a new GPU instance is provisioned.
-
-### Step 4: Run the Benchmark
-
-```bash
-# Wait for the pod to be ready
-oc get pods -w
-
-# Port-forward to the pod
-POD=$(oc get pod -l app=gemma-3-270m-gpu-predictor -o name)
-oc port-forward $POD 8080:8080 &
-
-# Single request test
-curl -s http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma-3-270m",
-    "prompt": "Being an IT professional is",
-    "stream": false,
-    "max_tokens": 30,
-    "stop": ["."]
-  }' | jq .
-
-# Or use the benchmark script
-./llamacpp-bench.sh benchmark 10 50
-```
-
-### Step 5: Clean Up
-
-```bash
-oc delete project vllm-benchmark
-```
-
-### RHOAI Deployment Notes
-
-| Topic | Details |
-|-------|---------|
-| **GPU taints** | GPU nodes typically have taints like `nvidia.com/gpu: Tesla-T4-SHARED`. Use `tolerations` with `operator: Exists` to schedule on any available GPU node. |
-| **`--dtype=half`** | Required for Tesla T4 (compute capability 7.5). T4 does not support bfloat16 - use float16 instead. |
-| **`--enforce-eager`** | Avoids Triton compilation issues with OpenShift's restricted filesystem. |
-| **`HOME=/tmp`** | OpenShift runs containers as non-root with a random UID. Set HOME and TRITON_CACHE_DIR to writable paths. |
-| **Storage initializer** | Use `serving.kserve.io/disableStorageInitializer: "true"` and mount the model via PVC to avoid HuggingFace token issues with the init container. |
-| **CPU-only alternative** | Replace `vllm/vllm-openai:v0.8.5` with `kserve/huggingfaceserver:v0.15.2`, remove GPU resources/tolerations, and use `--model_dir=/mnt/models` instead of `--model`. The OpenAI endpoints will be at `/openai/v1/` instead of `/v1/`. |
+See the [RHOAI instructions](rhoai/README.md) for storage topology, immutable
+model revisions, license terms, multi-GPU settings, measurement methodology,
+manual steps and troubleshooting. The historical Gemma/T4 observations above
+do not define the configuration or support scope of this workflow.
 
 ---
 

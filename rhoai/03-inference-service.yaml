@@ -1,54 +1,34 @@
-# InferenceService for Qwen2.5-3B-Instruct with GPU
-#
-# See 02-serving-runtime.yaml for image selection notes.
-# Adjust --dtype, --max-model-len, and GPU resources for your model and hardware.
+# KServe model deployment using the separately declared ServingRuntime.
 apiVersion: serving.kserve.io/v1beta1
 kind: InferenceService
 metadata:
   name: qwen25-3b
   annotations:
     serving.kserve.io/deploymentMode: RawDeployment
-    serving.kserve.io/disableStorageInitializer: "true"
 spec:
   predictor:
+    minReplicas: 1
+    maxReplicas: 1
     tolerations:
       - key: nvidia.com/gpu
         operator: Exists
         effect: NoSchedule
-    containers:
-      - name: kserve-container
-        image: registry.redhat.io/rhoai/odh-vllm-cuda-rhel9@sha256:293c6eb7571bd239516a175b1ebbd4e4bc3b1076022d7aaf6b7f16264227aebf
-        args:
-          - --port=8080
-          - --model=/mnt/models
-          - --served-model-name=qwen25-3b
-          - --dtype=auto
-          - --max-model-len=4096
-          - --enforce-eager
-        env:
-          - name: HOME
-            value: /tmp
-          - name: HF_HOME
-            value: /tmp/hf_home
-          - name: TRITON_CACHE_DIR
-            value: /tmp/.triton
-        ports:
-          - containerPort: 8080
-            protocol: TCP
-        volumeMounts:
-          - name: model-storage
-            mountPath: /mnt/models
-            readOnly: true
-        resources:
-          requests:
-            cpu: "4"
-            memory: "8Gi"
-            nvidia.com/gpu: "1"
-          limits:
-            cpu: "8"
-            memory: "16Gi"
-            nvidia.com/gpu: "1"
-    volumes:
-      - name: model-storage
-        persistentVolumeClaim:
-          claimName: model-pvc
+    model:
+      runtime: vllm-cuda-runtime
+      modelFormat:
+        name: vLLM
+      storageUri: pvc://model-pvc/
+      args:
+        - --dtype=auto
+        - --max-model-len=4096
+        - --enforce-eager
+        - --enable-prefix-caching
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+          nvidia.com/gpu: "1"
