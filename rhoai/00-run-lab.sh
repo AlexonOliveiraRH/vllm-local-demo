@@ -25,13 +25,7 @@ else
     unset EXPECTED_PROJECT_UID
 fi
 bash "$SCRIPT_DIR/01-setup-project.sh" "$PROJECT"
-# Resolve the installed supported image; the manifest remains a pinned example.
-VLLM_IMAGE=${VLLM_IMAGE:-$(oc get template vllm-cuda-runtime-template -n redhat-ods-applications -o jsonpath='{.objects[0].spec.containers[0].image}')}
-[[ -n $VLLM_IMAGE ]] || { echo "Set VLLM_IMAGE to an image compatible with your RHOAI version" >&2; exit 1; }
-export VLLM_IMAGE
-oc create --dry-run=client -f "$SCRIPT_DIR/02-serving-runtime.yaml" -o json |
-    python3 -c 'import json,os,sys; d=json.load(sys.stdin); d["spec"]["containers"][0]["image"]=os.environ["VLLM_IMAGE"]; print(json.dumps(d))' |
-    oc apply -n "$PROJECT" -f -
+bash "$SCRIPT_DIR/02-deploy-runtime.sh" "$PROJECT"
 oc apply -n "$PROJECT" -f "$SCRIPT_DIR/03-inference-service.yaml"
 oc wait -n "$PROJECT" --for=condition=Ready inferenceservice/qwen25-3b --timeout="${READY_TIMEOUT:-1200s}"
 bash "$SCRIPT_DIR/04-run-inference.sh" single

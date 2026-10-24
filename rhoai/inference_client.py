@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import statistics
 import sys
 import time
@@ -20,6 +21,18 @@ def headers():
     if os.environ.get("API_KEY"):
         result["Authorization"] = "Bearer " + os.environ["API_KEY"]
     return result
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        error = urllib.error.HTTPError(req.full_url, code, "HTTP redirects are not allowed", headers, fp)
+        error.close()
+        raise error
+
+
+def open_request(req, timeout):
+    """Use the final endpoint without forwarding credentials or rewriting requests."""
+    return urllib.request.build_opener(RejectRedirects()).open(req, timeout=timeout)
 
 
 def request(base_url, model, prompt, max_tokens, timeout, stream=False):
@@ -36,7 +49,7 @@ def request(base_url, model, prompt, max_tokens, timeout, stream=False):
     req = urllib.request.Request(base_url.rstrip("/") + "/v1/completions",
                                  data=json.dumps(payload).encode(), headers=headers())
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with open_request(req, timeout) as response:
             result["http_status"] = response.status
             if stream:
                 pieces, usage, first, last, done = [], None, None, None, False
@@ -119,7 +132,7 @@ def summarize(results, elapsed):
 
 def metrics(base_url, timeout):
     req = urllib.request.Request(base_url.rstrip("/") + "/metrics", headers=headers())
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with open_request(req, timeout) as response:
         text = response.read().decode()
     if "vllm:" not in text:
         raise ValueError("endpoint did not return vLLM metrics")
@@ -127,12 +140,123 @@ def metrics(base_url, timeout):
 
 
 def cache_counts(text):
-    result = {"queries": 0.0, "hits": 0.0}
+    """Return totals (None means absent) and individual series for reset checks."""
+    result = {"queries": None, "hits": None}
+    names = {"vllm:prefix_cache_" + key + "_total": key for key in result}
+    series = {}
     for line in text.splitlines():
-        for name in result:
-            if line.startswith("vllm:prefix_cache_" + name + "_total"):
-                result[name] += float(line.split()[-1])
-    return result
+        line = line.strip()
+        metric = re.match(r"[a-zA-Z_:][a-zA-Z0-9_:]*", line)
+        if not metric or metric[0] not in names:
+            continue
+        sample = re.fullmatch(
+            r'(?:\{(.*)\})?\s+([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)'
+            r'(?:\s+[+-]?[0-9]+)?', line[metric.end():])
+        if not sample:
+            raise ValueError("Malformed prefix counter sample")
+        labels = {}
+        remaining = (sample[1] or "").strip()
+        while remaining:
+            label = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\[\\n"])*)"\s*(?:,\s*|$)', remaining)
+            if not label or label[1] in labels:
+                raise ValueError("Malformed or duplicate prefix counter label")
+            labels[label[1]] = label[2]
+            remaining = remaining[label.end():]
+        name = names[metric[0]]
+        key = (name, tuple(sorted(labels.items())))
+        value = float(sample[2])
+        if not math.isfinite(value) or value < 0 or key in series:
+            raise ValueError("Invalid or duplicate prefix counter sample")
+        series[key] = value
+        result[name] = (result[name] or 0.0) + value
+        if not math.isfinite(result[name]):
+            raise ValueError("Nonfinite prefix counter total")
+    if (result["queries"] is not None and result["hits"] is not None
+            and result["hits"] > result["queries"]):
+        raise ValueError("Prefix counter hit total exceeds query total")
+    return result, series
+
+
+def prefix_experiment(base_url, model, prompt, max_tokens, timeout):
+    """Observe shared counters, without attributing their changes to our requests."""
+    poll_timeout = float(os.environ.get("PREFIX_METRICS_TIMEOUT", "10"))
+    if not math.isfinite(poll_timeout) or not 0 < poll_timeout <= 60:
+        raise ValueError("PREFIX_METRICS_TIMEOUT must be greater than 0 and at most 60 seconds")
+    unknown = {"queries": None, "hits": None}
+    evidence = {"status": "unavailable", "before": unknown.copy(), "after": unknown.copy(),
+                "polls": 0, "timeout_seconds": poll_timeout, "elapsed_seconds": 0.0}
+    output = {"mode": "prefix", "model": model, "prefix_counter_delta": unknown.copy(),
+              "cache_reuse_observed": False, "prefix_metrics": evidence,
+              "interpretation": "Counters are shared by the server: positive deltas do not establish "
+                                "that these requests caused reuse. Avoid other traffic. Two timings "
+                                "are illustrative, not a causal or statistical speedup guarantee."}
+    try:
+        before, previous = cache_counts(metrics(base_url, timeout))
+        evidence["before"] = before
+    except ValueError as error:
+        evidence.update(status="invalid", error=str(error))
+    except (HTTPException, OSError) as error:
+        evidence["error"] = "Baseline metrics fetch failed: " + type(error).__name__
+    # Keep inference evidence even when counters cannot validate the experiment.
+    output["cold"] = request(base_url, model, prompt, max_tokens, timeout, True)
+    output["warm"] = request(base_url, model, prompt, max_tokens, timeout, True)
+    if "error" in evidence:
+        return output
+    if any(value is None for value in before.values()):
+        evidence["error"] = "Both prefix counters must be present before the requests; absent is not zero"
+        return output
+    if not (output["cold"]["success"] and output["warm"]["success"]):
+        evidence.update(status="request_failed", error="Both streaming requests must succeed")
+        return output
+
+    started = time.monotonic()
+    deadline = started + poll_timeout
+    try:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            evidence["polls"] += 1
+            after, current = cache_counts(metrics(base_url, min(timeout, remaining)))
+            evidence["after"] = after
+            if time.monotonic() > deadline:
+                evidence.update(status="not_observed", error="Metrics arrived after the polling deadline")
+                output["prefix_counter_delta"] = unknown.copy()
+                break
+            if current.keys() - previous.keys():
+                raise ValueError("Prefix counter series changed during observation")
+            if any(current[key] < previous[key] for key in current):
+                raise ValueError("Prefix counter decreased or reset during observation")
+            # Track partial scrapes too: a reset cannot be hidden by a missing peer.
+            previous.update(current)
+            if any(value is None for value in after.values()):
+                evidence["status"] = "unavailable"
+                output["prefix_counter_delta"] = unknown.copy()
+            else:
+                if current.keys() != previous.keys():
+                    raise ValueError("Prefix counter series changed during observation")
+                delta = {key: after[key] - before[key] for key in before}
+                if delta["hits"] > delta["queries"]:
+                    raise ValueError("Prefix counter hit delta exceeds query delta")
+                output["prefix_counter_delta"] = delta
+                if delta["queries"] > 0 and delta["hits"] > 0:
+                    evidence["status"] = "observed"
+                    output["cache_reuse_observed"] = True
+                    return output
+                evidence["status"] = "not_observed"
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.25, remaining))
+        evidence.setdefault("error", "Positive hit and query deltas were not observed before the polling deadline")
+    except ValueError as error:
+        evidence.update(status="invalid", error=str(error))
+        output["prefix_counter_delta"] = unknown.copy()
+    except (HTTPException, OSError) as error:
+        evidence.update(status="unavailable", error="Metrics fetch failed: " + type(error).__name__)
+        output["prefix_counter_delta"] = unknown.copy()
+    finally:
+        evidence["elapsed_seconds"] = time.monotonic() - started
+    return output
 
 
 def main():
@@ -158,15 +282,8 @@ def main():
         prompt = "Experiment " + uuid.uuid4().hex + ". " + (
             "The service receives concurrent requests and reuses attention state for matching prompt prefixes. " * 128
         ) + "Summarize the service in one sentence."
-        before = cache_counts(metrics(base_url, timeout))
-        cold = request(base_url, model, prompt, max_tokens, timeout, True)
-        warm = request(base_url, model, prompt, max_tokens, timeout, True)
-        after = cache_counts(metrics(base_url, timeout))
-        output = {"mode": mode, "model": model, "cold": cold, "warm": warm,
-                  "prefix_counter_delta": {key: after[key] - before[key] for key in before},
-                  "cache_reuse_observed": after["hits"] > before["hits"],
-                  "interpretation": "Two requests are illustrative, not a statistical speedup claim. Cache counters are shared by the server."}
-        success = cold["success"] and warm["success"]
+        output = prefix_experiment(base_url, model, prompt, max_tokens, timeout)
+        success = output["cache_reuse_observed"]
     elif mode in ("single", "benchmark"):
         if mode == "benchmark":
             for _ in range(warmup):

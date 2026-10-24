@@ -131,7 +131,7 @@ if oc get job download-model -n "$PROJECT" &>/dev/null; then
     if [ "$JOB_STATUS" = "1" ]; then
         printf "✅ Model ${GREEN}already downloaded${NC}\n"
         printf "\n✅ ${GREEN}Setup complete!${NC}\n"
-        printf "   Next: Apply the ServingRuntime and InferenceService manifests\n\n"
+        printf "   Next: ./02-deploy-runtime.sh %s, then apply 03-inference-service.yaml\n\n" "$PROJECT"
         exit 0
     else
         printf "➡️ Existing download job found; waiting without interrupting it...\n"
@@ -220,6 +220,6 @@ fi
 printf "\n✅ ${GREEN}Setup complete!${NC}\n"
 printf "   Model downloaded to PVC ${YELLOW}model-pvc${NC}\n"
 printf "   Next steps:\n"
-printf "     1. oc apply -f 02-serving-runtime.yaml\n"
+printf "     1. ./02-deploy-runtime.sh %s\n" "$PROJECT"
 printf "     2. oc apply -f 03-inference-service.yaml\n"
 printf "     3. ./04-run-inference.sh\n\n"

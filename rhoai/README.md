@@ -5,9 +5,38 @@ OpenAI-compatible vLLM API. This is an educational lab, not a production securit
 or capacity-planning reference. The scripts do not configure public routes,
 authentication policies, autoscaling, or monitoring dashboards.
 
+## Validated configuration
+
+The full disposable lifecycle passed on October 24, 2026, with this configuration:
+
+| Component | Tested version or setting |
+| --- | --- |
+| OpenShift Container Platform | 4.22.19 |
+| Red Hat OpenShift AI | 3.5.2 |
+| GPU Operator / NVIDIA driver | 26.7.2 / 615.71.09 |
+| GPU | One NVIDIA L4, 24 GB class |
+| Runtime package | vLLM 0.24.0+rhaiv.15 |
+| Model | Qwen2.5-3B-Instruct, pinned revision below |
+| Serving | KServe RawDeployment, BF16, eager execution, 4096-token context |
+| Prefix caching | Enabled |
+
+Validation covered fresh model download, runtime deployment, readiness, single
+inference, streaming concurrency at 1/4/8, metrics, prefix-cache counters, and
+automatic UID-protected cleanup. A separate Pod-local check validated the model
+listing and chat-completions API. The predictor stayed on the same image and node
+with zero restarts during measurement. External inference ingress/authentication,
+autoscaling, multi-GPU operation, and production capacity were not tested.
+
+These are recorded test versions, not moving `latest` requirements. Resolve the
+runtime from your installed template and consult the
+[OpenShift AI supported configurations](https://access.redhat.com/articles/rhoai-supported-configs)
+and [AI Inference version matrix](https://access.redhat.com/articles/rhaii-supported-configs)
+when choosing your own compatible stack. Use a prepared cluster that meets the
+prerequisites below.
+
 ## Prerequisites
 
-- OpenShift AI with KServe managed and an NVIDIA GPU with capacity available.
+- OpenShift AI 3.5 with KServe managed and an NVIDIA GPU with capacity available.
 - A storage class with `WaitForFirstConsumer` binding. The script selects the
   default class; set `STORAGE_CLASS` explicitly if needed. Immediate-binding
   classes are rejected because they can provision a volume outside the GPU zone.
@@ -15,17 +44,19 @@ authentication policies, autoscaling, or monitoring dashboards.
   containing a usable GPU. The setup selects the first labeled GPU node's zone;
   set `STORAGE_ZONE` explicitly when multiple GPU pools exist. On clusters without
   zone labels, it uses that GPU node's hostname for the download Job.
-- An authenticated `oc` client, Bash, Python 3.9+, and `curl`. Python uses only its
+- An authenticated `oc` client matching your OpenShift release, Bash, Python 3.9+,
+  and `curl`. Obtain the client from your console's **Command Line Tools** page
+  or the [OpenShift CLI download instructions](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/cli_tools/openshift-cli-oc).
+  Python uses only its
   standard library. Read access to node labels and the runtime template is needed,
   in addition to permissions to create projects and namespaced serving resources.
 - Registry access for the selected runtime, and cluster egress to the model hub
   and Python package index. The download image is UBI Python 3.11 and installs
   `huggingface_hub==0.34.4`.
 
-This configuration uses RawDeployment, not Knative. Follow the prerequisites for
-your installed OpenShift AI release rather than assuming all serving modes require
-the same operators. The supplied configuration targets the 2.25 serving APIs;
-features documented for 3.5 are not automatically available here.
+This configuration uses KServe RawDeployment on OpenShift AI 3.5, not Knative.
+Follow the prerequisites for your installed OpenShift AI release rather than
+assuming all serving modes require the same operators.
 
 ### Model license
 
@@ -77,6 +108,7 @@ it is not a performance superiority or production-readiness certification.
 
 - `00-run-lab.sh`: orchestration (`up` or disposable `verify`).
 - `01-setup-project.sh`: project, annotated PVC, immutable model download.
+- `02-deploy-runtime.sh`: shared image resolution and runtime deployment.
 - `02-serving-runtime.yaml`: runtime image, API process, environment, health probes.
 - `03-inference-service.yaml`: references that runtime and `pvc://model-pvc/`.
 - `04-run-inference.sh`: readiness and owned port-forward, then the Python client.
@@ -89,16 +121,27 @@ For individual steps:
 ```bash
 ./01-setup-project.sh vllm-demo
 oc project vllm-demo
-# Inspect the compatible image for your installed release:
-oc get template vllm-cuda-runtime-template -n redhat-ods-applications \
-  -o jsonpath='{.objects[0].spec.containers[0].image}'
-# Update the image in 02-serving-runtime.yaml if necessary.
-oc apply -f 02-serving-runtime.yaml
+./02-deploy-runtime.sh vllm-demo
 oc apply -f 03-inference-service.yaml
 oc wait --for=condition=Ready inferenceservice/qwen25-3b --timeout=1200s
 oc logs -l serving.kserve.io/inferenceservice=qwen25-3b -c kserve-container
 PROJECT=vllm-demo ./04-run-inference.sh
 ```
+
+Both workflows use `02-deploy-runtime.sh` to select the `kserve-container` image
+from the installed RHOAI template. The helper preserves the local runtime
+configuration and never edits `02-serving-runtime.yaml`. The YAML's pinned
+digest is an OpenShift AI 3.5.2 example, not a mechanism for selecting the latest
+compatible build. The documented workflows resolve the image from the installed
+template. A missing or ambiguous installed image stops deployment instead of
+silently using that example. To select a compatible image explicitly, use
+`VLLM_IMAGE=registry.example/runtime:<tested-version> ./02-deploy-runtime.sh vllm-demo`.
+
+The helper also copies the optional `opendatahub.io/runtime-version` display
+annotation from the same selected ServingRuntime template object. An explicit
+`VLLM_IMAGE` override bypasses template lookup and does not infer a package version;
+no runtime-version annotation is added in that case. This display metadata does
+not prove the vLLM Python package version installed in the running container.
 
 The model specification uses `predictor.model.runtime: vllm-cuda-runtime`; it is
 not a separate custom-container predictor. KServe mounts the PVC in the model
@@ -150,10 +193,37 @@ Measurements:
   interval for tokens/s. An idle cache snapshot is not a utilization benchmark.
 
 `prefix` uses a unique, long repeated prefix with two sequential streaming
-requests. It reports `cache_reuse_observed` and server counter deltas. The counters
-are shared; avoid other traffic. Two timings illustrate behavior but do not prove
-a statistically significant speedup. Caching reuses full token blocks and can
-work with the completions API; a very short prompt may have no reusable block.
+requests. It observes `vllm:prefix_cache_queries_total` and
+`vllm:prefix_cache_hits_total`: the local prefix-cache token counters documented
+by [vLLM](https://docs.vllm.ai/en/stable/usage/metrics/), exposed with the
+[`_total` suffix](https://prometheus.github.io/client_python/instrumenting/counter/).
+External-cache counters and similarly named metrics are not substitutes.
+
+Both counters must be present in the baseline; missing samples are not zero.
+After the requests, the client polls every 0.25 seconds for asynchronous metric
+publication, for up to `PREFIX_METRICS_TIMEOUT` seconds (default 10; must be
+greater than 0 and at most 60). Each polling request uses the smaller of
+`REQUEST_TIMEOUT` and the remaining polling budget as its socket timeout.
+The polling budget starts after inference; it does not bound the baseline fetch
+or the two inference requests, which use `REQUEST_TIMEOUT` separately.
+
+Exit status 0 and `cache_reuse_observed: true` require two successful requests
+and positive deltas for **both** hit and query counters within that window.
+Missing counters, no observed reuse, malformed/nonfinite/negative values,
+duplicate samples, counter decreases/resets, or changed series cannot pass.
+Totals or deltas with more hits than queries are rejected as inconsistent evidence.
+An observed zero remains numeric zero; unavailable or invalid deltas are `null`.
+The existing `cold`, `warm`, `prefix_counter_delta`, `cache_reuse_observed`, and
+`interpretation` evidence fields remain. The additive `prefix_metrics` object
+records baseline/latest counts, poll count, timeout, elapsed polling time, and
+status (`observed`, `not_observed`, `unavailable`, `invalid`, or `request_failed`),
+with an error explanation when validation fails.
+
+Counters are aggregated across the server's exposed series and are shared; avoid
+other traffic. Positive deltas do not establish that these two requests caused
+the reuse, and two timings do not guarantee a causal or statistically significant
+speedup. Caching reuses full token blocks and can work with the completions API;
+a very short prompt may have no reusable block.
 
 For sustained workloads and quality assessment, use
 [GuideLLM](https://github.com/vllm-project/guidellm) and
@@ -170,7 +240,8 @@ attribute a GPU-versus-CPU configuration difference solely to the engine.
   `DOWNLOAD_TIMEOUT` (default 1800s).
   `DOWNLOAD_IMAGE` can pin a compatible UBI Python 3.11 image digest; the default
   image tag follows UBI updates. Record resolved image digests with your evidence.
-- Deployment: `VLLM_IMAGE` overrides installed-template image resolution in `up`.
+- Deployment: `VLLM_IMAGE` overrides installed-template image resolution in both
+  `02-deploy-runtime.sh` and `00-run-lab.sh`.
   Check model/runtime/hardware support for the specific downstream release.
 - Client: `PROJECT`, `MODEL_NAME`, `INGRESS_PORT` (8080), `READY_TIMEOUT`,
   `BASE_URL`, `API_KEY`, `REQUEST_TIMEOUT` (120 seconds), `PROMPT`, `MAX_TOKENS`,
@@ -182,6 +253,11 @@ The local port-forward is bound to loopback and only its own child process is
 stopped. Do not expose unauthenticated inference or metrics publicly.
 `BASE_URL` and `RESULTS_FILE` are rejected by `00-run-lab.sh`; they belong to
 individual client invocations, not the self-contained lifecycle check.
+
+Set `BASE_URL` to the final endpoint: completions and metrics reject HTTP redirects,
+including same-origin redirects, before sending any request to the destination.
+Direct loopback HTTP and direct HTTPS remain supported. Use HTTPS for remote
+endpoints carrying `API_KEY`; plain HTTP does not encrypt the bearer token.
 
 Setup records model identity on the PVC and model/revision/PVC UID on the download
 Job. A missing PVC, mismatched Job, or unrecorded identity cannot be treated as
@@ -231,14 +307,21 @@ failures. A download timeout does not delete its Job. Increase `DOWNLOAD_TIMEOUT
 and rerun after inspecting its status. Cleanup asks for confirmation and deletes
 the selected project, including model storage according to its reclaim policy.
 
-Run local tests with `python3 -m unittest discover -s tests -v`. They use loopback
-HTTP and controlled command fixtures, not cluster credentials. A clean local test
-run does not replace the disposable lifecycle check.
+Run local tests with `python3 -m unittest discover -s tests -v`. The tests additionally
+require PyYAML for semantic manifest checks; install it in a virtual environment
+with `python3 -m pip install PyYAML`. The runtime scripts and client still use only
+the Python standard library. Tests use loopback HTTP and controlled command
+fixtures, not cluster credentials. A clean local test run does not replace the
+disposable lifecycle check.
 
 ## References
 
-- [vLLM serving arguments, version 0.10.1](https://docs.vllm.ai/en/v0.10.1/cli/serve.html)
-- [vLLM prefix-cache design](https://docs.vllm.ai/en/v0.10.1/design/prefix_caching.html)
+Upstream references explain engine behavior; they do not define Red Hat support.
+Use the OpenShift AI documentation for the prerequisites and supported combinations
+of your installed product release.
+
+- [Upstream vLLM serving arguments, version 0.24.0](https://docs.vllm.ai/en/v0.24.0/cli/serve/)
+- [Upstream vLLM prefix-cache design, version 0.24.0](https://docs.vllm.ai/en/v0.24.0/design/prefix_caching/)
 - [OpenShift AI documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed)
 - [KServe documentation](https://kserve.github.io/website/)
 - [Kubernetes GPU resource requirements](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)

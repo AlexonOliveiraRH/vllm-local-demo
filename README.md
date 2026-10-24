@@ -23,6 +23,7 @@ vllm-local-demo/
 ├── rhoai/
 │   ├── 00-run-lab.sh               # Prepare a lab or verify its full lifecycle
 │   ├── 01-setup-project.sh         # Create project, PVC, download model
+│   ├── 02-deploy-runtime.sh        # Resolve installed image and deploy runtime
 │   ├── 02-serving-runtime.yaml     # vLLM CUDA ServingRuntime for KServe
 │   ├── 03-inference-service.yaml   # InferenceService with GPU (RawDeployment)
 │   ├── 04-run-inference.sh         # Validated inference, benchmark, metrics, prefix
@@ -38,9 +39,9 @@ vllm-local-demo/
 
 ## Prerequisites
 
-1. **Hugging Face token** - Accept the model's terms and generate a user access token: [Hugging Face tokens guide](https://huggingface.co/docs/hub/en/security-tokens)
+1. **Model access and license** - Review the selected model's terms. Gated or private models require a Hugging Face token: [Hugging Face tokens guide](https://huggingface.co/docs/hub/en/security-tokens). Follow the prerequisites for the chosen workflow; a token is not a universal requirement for every model.
 
-2. **A local Kubernetes cluster** - Choose one of the two options below.
+2. **A compatible cluster** - Choose Kind, MicroShift, or the [OpenShift AI GPU lab](rhoai/README.md). Each workflow has its own infrastructure and client prerequisites.
 
 ---
 
@@ -517,6 +518,9 @@ model revisions, license terms, multi-GPU settings, measurement methodology,
 manual steps and troubleshooting. The historical Gemma/T4 observations above
 do not define the configuration or support scope of this workflow.
 
+For the original Gemma/T4 setup, see the
+[historical appendix](#historical-appendix-gemma-3-270m-on-tesla-t4-with-rhoai).
+
 ---
 
 ## Component Breakdown
@@ -525,7 +529,8 @@ do not define the configuration or support scope of this workflow.
 * **MicroShift (minc)** - Single-node OpenShift running as a Podman container, providing an OpenShift-compatible environment.
 * **KServe** - Kubernetes-native model serving platform that handles full model lifecycle, scaling, and routing.
 * **vLLM Backend** - Delivers fast, efficient inference with optimizations like KV cache memory management (PagedAttention), speculative decoding, and continuous batching.
-* **Gemma-3-270m** - The Hugging Face model you're serving; requires token-based authentication from a Hugging Face account.
+* **Gemma-3-270m** - The gated model used by the Kind/MicroShift examples and historical T4 appendix; requires authorized Hugging Face access.
+* **Qwen2.5-3B-Instruct** - The default model for the maintained [OpenShift AI lab](rhoai/README.md); review its separate model license and pinned revision there.
 
 ---
 
@@ -615,3 +620,240 @@ The `VLLM_ATTENTION_BACKEND=CPU_ATTN` environment variable was used in older ver
 * [Hugging Face Security Tokens](https://huggingface.co/docs/hub/en/security-tokens)
 
 ---
+
+## Historical Appendix: Gemma-3-270m on Tesla T4 with RHOAI
+
+> **Historical reference only.** This appendix records the Gemma-3-270m/Tesla T4
+> configuration from commit `edb8e72`, including the original upstream
+> `vllm/vllm-openai:v0.8.5` custom container. These instructions have not been
+> executed or retested as part of the current validation. That validation does
+> not establish compatibility or support for this historical configuration.
+> New users should start with the maintained [RHOAI workflow](rhoai/README.md)
+> in [`rhoai/`](rhoai/).
+
+The following five steps preserve the original project, PVC, download Job,
+InferenceService, request parameters, and legacy benchmark invocation for
+historical traceability. They are archival examples, not a currently validated
+deployment recipe. The custom-container predictor below does not select the
+`ServingRuntime` used by the maintained workflow. Credentials are placeholders;
+filesystem paths in the manifests refer to locations inside the containers.
+
+### Historical prerequisites
+
+- An RHOAI cluster with KServe and a Tesla T4 GPU available to the workload.
+- An installed, authenticated `oc` client and permission to create the resources.
+- Access to `google/gemma-3-270m`, acceptance of its terms, and a Hugging Face token.
+- `curl` and `jq` for the request example; Bash, `bc`, and the command-line
+  utilities used by the legacy [benchmark script](llamacpp-bench.sh).
+
+### Step 1: Create a Project
+
+```bash
+oc new-project vllm-benchmark
+```
+
+### Step 2: Download the Model via a Job
+
+The original setup downloaded the model into a PVC using a separate Job with a
+mounted token Secret. It then disabled the serving Pod's storage initializer and
+mounted that PVC directly. This records the chosen download path; it does not
+imply that all RHOAI installations require this workaround.
+
+```bash
+# Placeholder only; no credential is included in this example.
+oc create secret generic huggingface-secret --from-literal=token='<your_token>'
+
+# Create PVC for model storage
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gemma-model-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+EOF
+
+# Download the model
+cat <<'EOF' | oc apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-model
+spec:
+  template:
+    spec:
+      containers:
+        - name: downloader
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command:
+            - bash
+            - -c
+            - |
+              pip install -q huggingface_hub && \
+              python -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download(
+                  'google/gemma-3-270m',
+                  local_dir='/mnt/models',
+                  token='$(cat /secret/token)'
+              )
+              print('Download complete!')
+              "
+          volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/models
+            - name: hf-token
+              mountPath: /secret
+              readOnly: true
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: gemma-model-pvc
+        - name: hf-token
+          secret:
+            secretName: huggingface-secret
+      restartPolicy: Never
+  backoffLimit: 2
+EOF
+
+# Original manual observation of download completion
+oc get pods -w
+```
+
+This example did not pin a model revision, the downloader image digest, or the
+`huggingface_hub` version. It did not select a storage class or GPU zone. Its
+resource settings therefore do not guarantee a reproducible download or
+compatible volume placement on another cluster. Watching Pods is not an
+automated check of Job success.
+
+### Step 3: Deploy vLLM with GPU
+
+The historical InferenceService used RawDeployment and a directly specified
+vLLM 0.8.5 container, with FP16, eager execution, and one requested GPU:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: gemma-3-270m-gpu
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+    serving.kserve.io/disableStorageInitializer: "true"
+spec:
+  predictor:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    containers:
+      - name: kserve-container
+        image: vllm/vllm-openai:v0.8.5
+        args:
+          - --port=8080
+          - --model=/mnt/models
+          - --served-model-name=gemma-3-270m
+          - --dtype=half
+          - --enforce-eager
+        env:
+          - name: HOME
+            value: /tmp
+          - name: TRITON_CACHE_DIR
+            value: /tmp/.triton
+        ports:
+          - containerPort: 8080
+            protocol: TCP
+        volumeMounts:
+          - name: model-storage
+            mountPath: /mnt/models
+            readOnly: true
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+    volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: gemma-model-pvc
+EOF
+```
+
+| Historical setting | Interpretation and limitation |
+|--------------------|-------------------------------|
+| `vllm/vllm-openai:v0.8.5` | Original upstream custom-container image, not the installed RHOAI runtime selected by the maintained lab. Its model/runtime compatibility has not been revalidated. |
+| GPU toleration | Permits the matching taint; it does not select a Tesla T4, guarantee available capacity, or resolve PVC topology constraints. |
+| `--dtype=half` | Selects FP16 for the T4 configuration; automatic dtype selection must not be assumed to make a BF16 model compatible with T4. |
+| `--enforce-eager` | Disables CUDA-graph execution. It is not a general fix for Triton compilation or filesystem permissions. |
+| `HOME` and `TRITON_CACHE_DIR` | Point to writable locations inside the container; their actual permissions still depend on the image and cluster security configuration. |
+| Disabled storage initializer | Relies on the separate download Job and mounted PVC; it does not verify that the model download succeeded. |
+
+### Step 4: Run the Benchmark
+
+The original sequence observed Pods, forwarded a predictor Pod to loopback, and
+sent a non-streaming completion request. The Pod selector and manual readiness
+step are retained as historical details, not current readiness guarantees.
+
+```bash
+# Original manual readiness observation
+oc get pods -w
+
+# Port-forward to the pod
+POD=$(oc get pod -l app=gemma-3-270m-gpu-predictor -o name)
+oc port-forward "$POD" 8080:8080 &
+
+# Single request test
+curl -s http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-3-270m",
+    "prompt": "Being an IT professional is",
+    "stream": false,
+    "max_tokens": 30,
+    "stop": ["."]
+  }' | jq .
+
+# Original legacy harness invocation from the repository root
+./llamacpp-bench.sh benchmark 10 50
+```
+
+**Legacy timing-only harness limitations:** In benchmark mode, the original
+`llamacpp-bench.sh` discarded response bodies and recorded curl timing values
+without retaining HTTP status, validating completions, or counting actual output
+tokens per request. Failed requests could contribute to the displayed request
+rate. Its llama.cpp labels and `/props` probe did not verify which engine served
+the requests. Non-streaming time to first byte is not token-level TTFT, and
+`max_tokens: 30` with a stop string does not guarantee 30 generated tokens.
+
+These limitations apply to the [historical performance tables](#performance-comparison-vllm-vs-llamacpp).
+Different hardware, precisions, runtime versions, and serving paths prevent
+those results from isolating engine effects. The comparison does not prove
+vLLM or llama.cpp superiority, a model-size threshold for GPU benefits, or the
+causal effect of PagedAttention or continuous batching. Use the maintained
+[RHOAI measurement workflow](rhoai/README.md#measurement-and-a-practical-demo)
+for new experiments.
+
+### Step 5: Clean Up
+
+The original cleanup deleted the entire example project, including its
+namespaced resources. It did not manage the background port-forward process,
+which must be stopped separately.
+
+```bash
+oc delete project vllm-benchmark
+```

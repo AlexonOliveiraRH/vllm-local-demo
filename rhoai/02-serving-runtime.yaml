@@ -1,12 +1,12 @@
 # vLLM CUDA ServingRuntime for KServe on RHOAI
 #
-# The image below comes from the RHOAI 2.25 vllm-cuda-runtime-template.
-# To find the correct image for your RHOAI version, run:
-#   oc get template vllm-cuda-runtime-template -n redhat-ods-applications \
-#     -o jsonpath='{.objects[0].spec.containers[0].image}'
+# The digest below is an RHOAI 3.5.2 example, not a latest-compatible selector.
+# Deploy with ./02-deploy-runtime.sh [project], which resolves the installed
+# template image without editing this file. 00-run-lab.sh uses the same helper.
+# Set VLLM_IMAGE to an explicitly selected compatible image when needed.
 #
 # Alternatively, use the upstream vLLM image (no Red Hat subscription required):
-#   image: vllm/vllm-openai:latest
+#   VLLM_IMAGE=vllm/vllm-openai:<tested-version> ./02-deploy-runtime.sh vllm-demo
 apiVersion: serving.kserve.io/v1alpha1
 kind: ServingRuntime
 metadata:
@@ -14,15 +14,18 @@ metadata:
   annotations:
     opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
     openshift.io/display-name: vLLM NVIDIA GPU ServingRuntime for KServe
+    # The dashboard reads template-display-name, not openshift.io/display-name.
+    opendatahub.io/template-display-name: vLLM NVIDIA GPU ServingRuntime for KServe
   labels:
     opendatahub.io/dashboard: "true"
 spec:
   annotations:
+    opendatahub.io/kserve-runtime: vllm
     prometheus.io/path: /metrics
     prometheus.io/port: "8080"
   containers:
     - name: kserve-container
-      image: registry.redhat.io/rhoai/odh-vllm-cuda-rhel9@sha256:293c6eb7571bd239516a175b1ebbd4e4bc3b1076022d7aaf6b7f16264227aebf
+      image: registry.redhat.io/rhaii/vllm-cuda-rhel9@sha256:fd9540f3882b9aae5f862eba6c295d0e9c6b43f8c17b27b179481bfa330bfbc1
       command:
         - python
         - -m
