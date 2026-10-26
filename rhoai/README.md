@@ -34,21 +34,40 @@ and [AI Inference version matrix](https://access.redhat.com/articles/rhaii-suppo
 when choosing your own compatible stack. Use a prepared cluster that meets the
 prerequisites below.
 
+### Portability validation
+
+On October 26, 2026, the disposable lifecycle also passed on OpenShift 4.22.16,
+OpenShift AI 3.5.1, and vLLM 0.24.0+rhaiv.13 with one NVIDIA L4. That cluster had
+mixed GPU generations, a custom GPU scheduling taint, and no node zone labels.
+The resolver selected a compatible GPU without a hostname in the source files.
+Separate fresh runs exercised shared Ceph RBD storage with `Immediate` binding
+and Ceph RBD with `WaitForFirstConsumer`, including model download, serving,
+concurrency 1/4/8, metrics, observed cache reuse, and project cleanup.
+
+These results validate those configurations. Other accelerator types, model
+sizes, storage drivers, network policies, and quotas need their own lifecycle
+check. The inference protocol and the lab's purpose remain the same across
+clusters: observe serving, concurrency, and prefix-cache behavior on a measured
+configuration.
+
 ## Prerequisites
 
-- OpenShift AI 3.5 with KServe managed and an NVIDIA GPU with capacity available.
-- A storage class with `WaitForFirstConsumer` binding. The script selects the
-  default class; set `STORAGE_CLASS` explicitly if needed. Immediate-binding
-  classes are rejected because they can provision a volume outside the GPU zone.
-  For zonal storage, the download must run in a zone
-  containing a usable GPU. The setup selects the first labeled GPU node's zone;
-  set `STORAGE_ZONE` explicitly when multiple GPU pools exist. On clusters without
-  zone labels, it uses that GPU node's hostname for the download Job.
+- OpenShift AI 3.5 with KServe managed and an available NVIDIA GPU supported by
+  the installed CUDA runtime. The resolver requires GPU Feature Discovery labels
+  and compute capability 7.5 or newer; model memory and runtime-specific kernel
+  requirements still apply. The default model was tested on a 24 GB class L4.
+- A storage class that can provide the requested PVC. The default class is used;
+  set `STORAGE_CLASS` to select another. `WaitForFirstConsumer` is the safe default
+  for storage with node or zone restrictions. For shared storage with `Immediate`
+  binding, set `STORAGE_TOPOLOGY=shared` only after confirming that its volumes
+  can be mounted from the selected GPU node. This is a storage accessibility
+  declaration, not an automatic check of the backend.
 - An authenticated `oc` client matching your OpenShift release, Bash, Python 3.9+,
   and `curl`. Obtain the client from your console's **Command Line Tools** page
   or the [OpenShift CLI download instructions](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/cli_tools/openshift-cli-oc).
   Python uses only its
-  standard library. Read access to node labels and the runtime template is needed,
+  standard library. Read access to GPU nodes, Pods across namespaces (for GPU
+  allocation checks), storage classes, and the runtime template is needed,
   in addition to permissions to create projects and namespaced serving resources.
 - Registry access for the selected runtime, and cluster egress to the model hub
   and Python package index. The download image is UBI Python 3.11 and installs
@@ -85,6 +104,49 @@ template, deploys, waits for model health, and runs one validated inference. It
 leaves the lab running. First-time download and image pulls can take many minutes;
 prepare the lab before a live demonstration.
 
+### Placement on different clusters
+
+The scripts discover the installed runtime image and available compatible GPUs.
+They exclude unsupported GPU architectures, cordoned or unready nodes, nodes
+with unmatched scheduling taints, and GPUs already allocated to other Pods.
+The selection is a point-in-time check, not a reservation. CPU, host memory,
+GPU memory, quotas, and concurrent scheduling can still prevent deployment.
+
+Set only the overrides your cluster requires before running either workflow:
+
+```bash
+# Optional: limit selection to a particular GPU pool using Kubernetes labels.
+export GPU_NODE_SELECTOR='{"nvidia.com/gpu.product":"NVIDIA-L4"}'
+
+# Optional: replace the default nvidia.com/gpu toleration with the exact
+# tolerations allowed for your GPU pool. Do not bypass another team's taints.
+export GPU_TOLERATIONS='[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"},{"key":"feature.node.kubernetes.io/gpu-node","operator":"Exists","effect":"NoSchedule"}]'
+
+# Optional: choose a non-default storage class.
+export STORAGE_CLASS=your-storage-class
+
+# Required only for Immediate binding on confirmed shared storage.
+export STORAGE_TOPOLOGY=shared
+```
+
+Do not copy every override blindly. Unset optional variables to use discovery.
+The default toleration is `nvidia.com/gpu` with `Exists` and `NoSchedule`.
+`GPU_NODE_SELECTOR` is a JSON map of exact label matches; `GPU_TOLERATIONS` is a
+JSON array with explicit keys and effects. Neither contains a required GPU model,
+node name, storage class, or cluster endpoint. `STORAGE_ZONE` remains available
+as an optional filter for clusters that have `topology.kubernetes.io/zone` labels.
+
+The chosen hostname and tolerations are recorded on the model PVC. The download
+Job and predictor use that same placement, including on clusters without zone
+labels. A rerun reuses the saved placement; use a new project to move the lab to
+another node or GPU pool. An older PVC with topology constraints but no saved
+placement requires a fresh project rather than guessing where its volume fits.
+The download Job uses CPU and memory; it does not request a GPU.
+
+After changing clusters, run the full lifecycle check below before using the lab
+live. A different runtime build, GPU, or shared workload can change measured
+throughput and latency. Keep configuration and benchmark evidence together.
+
 `RESULTS_FILE` is optional and must not already exist. JSON output includes
 per-request status, actual token counts, errors, and timing. Keep raw evidence
 outside version control unless it has been reviewed for sensitive prompts and
@@ -98,11 +160,15 @@ result records.
 ```
 
 `verify` exclusively creates a new project and refuses an existing one. It runs setup, deployment, readiness, single
-inference, a concurrent benchmark, metrics, and a prefix-cache experiment, then
+inference, concurrent benchmarks at 1, 4, and 8 requests in flight, metrics, and a prefix-cache experiment, then
 deletes only that verification project, using its UID as a server-side deletion
 precondition. A recreated project with the same name is not deleted. A failing step exits nonzero and leaves
 resources for inspection. A printed lifecycle pass means all commands succeeded;
 it is not a performance superiority or production-readiness certification.
+By default, `verify` uses streaming, 32 completion tokens, EOS ignored, and 12
+measured requests at each concurrency level. `MAX_TOKENS` and `IGNORE_EOS` can
+override those two settings. The inference client excludes warm-up requests from
+its benchmark totals. Keep the same protocol when comparing runs.
 
 ## Files and manual workflow
 
@@ -111,6 +177,8 @@ it is not a performance superiority or production-readiness certification.
 - `02-deploy-runtime.sh`: shared image resolution and runtime deployment.
 - `02-serving-runtime.yaml`: runtime image, API process, environment, health probes.
 - `03-inference-service.yaml`: references that runtime and `pvc://model-pvc/`.
+- `03-deploy-model.sh`: applies the model using the PVC's saved placement.
+- `placement.py`: validates configuration and selects a compatible GPU node.
 - `04-run-inference.sh`: readiness and owned port-forward, then the Python client.
 - `inference_client.py`: response validation, streaming timing, JSON evidence.
 - `05-cleanup.sh`: confirmed project deletion, with errors propagated.
@@ -122,7 +190,7 @@ For individual steps:
 ./01-setup-project.sh vllm-demo
 oc project vllm-demo
 ./02-deploy-runtime.sh vllm-demo
-oc apply -f 03-inference-service.yaml
+./03-deploy-model.sh vllm-demo
 oc wait --for=condition=Ready inferenceservice/qwen25-3b --timeout=1200s
 oc logs -l serving.kserve.io/inferenceservice=qwen25-3b -c kserve-container
 PROJECT=vllm-demo ./04-run-inference.sh
@@ -236,7 +304,9 @@ attribute a GPU-versus-CPU configuration difference solely to the engine.
 ## Configuration
 
 - Setup: positional project name; `MODEL_ID`, immutable `MODEL_REVISION`,
-  `PVC_SIZE` (default 10Gi), `HF_TOKEN` for gated models, `STORAGE_CLASS`, `STORAGE_ZONE`, and
+  `PVC_SIZE` (default 10Gi), `HF_TOKEN` for gated models, `STORAGE_CLASS`,
+  `STORAGE_TOPOLOGY` (`auto` or explicit `shared`), `STORAGE_ZONE`,
+  `GPU_NODE_SELECTOR`, `GPU_TOLERATIONS`, and
   `DOWNLOAD_TIMEOUT` (default 1800s).
   `DOWNLOAD_IMAGE` can pin a compatible UBI Python 3.11 image digest; the default
   image tag follows UBI updates. Record resolved image digests with your evidence.

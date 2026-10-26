@@ -6,6 +6,7 @@
 #   HF_TOKEN=hf_xxx ./01-setup-project.sh          # with HuggingFace token (for gated models)
 
 set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 PROJECT=${1:-vllm-demo}
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-3B-Instruct}
@@ -32,17 +33,12 @@ if len(defaults) != 1:
     sys.exit("Set STORAGE_CLASS explicitly: exactly one default storage class is required")
 print(defaults[0])')}
 [[ $STORAGE_CLASS =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || { echo "Invalid STORAGE_CLASS" >&2; exit 2; }
-BINDING_MODE=$(oc get storageclass "$STORAGE_CLASS" -o jsonpath='{.volumeBindingMode}')
-[[ $BINDING_MODE == WaitForFirstConsumer ]] || { echo "STORAGE_CLASS must use WaitForFirstConsumer for GPU-aware placement" >&2; exit 2; }
-# Avoid binding a zonal volume to a CPU-only zone on multi-zone clusters.
-STORAGE_ZONE=${STORAGE_ZONE:-$(oc get nodes -l nvidia.com/gpu.present=true -o jsonpath='{.items[0].metadata.labels.topology\.kubernetes\.io/zone}')}
-STORAGE_KEY=topology.kubernetes.io/zone
-STORAGE_VALUE=$STORAGE_ZONE
-if [[ -z $STORAGE_VALUE ]]; then
-    STORAGE_KEY=kubernetes.io/hostname
-    STORAGE_VALUE=$(oc get nodes -l nvidia.com/gpu.present=true -o jsonpath='{.items[0].metadata.labels.kubernetes\.io/hostname}')
-fi
-[[ $STORAGE_VALUE =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "No GPU placement found. Set STORAGE_ZONE to a zone with an available GPU node." >&2; exit 2; }
+export STORAGE_CLASS
+PLACEMENT=$(python3 "$SCRIPT_DIR/placement.py" plan "$PROJECT")
+PLACEMENT_ANNOTATION=$(printf '%s' "$PLACEMENT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+NODE_SELECTOR=$(printf '%s' "$PLACEMENT" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["nodeSelector"]))')
+TOLERATIONS=$(printf '%s' "$PLACEMENT" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["tolerations"]))')
+printf 'Resolved placement: %s\n' "$PLACEMENT"
 
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -82,6 +78,7 @@ if oc get pvc model-pvc -n "$PROJECT" &>/dev/null; then
     fi
     STORED_CLASS=$(oc get pvc model-pvc -n "$PROJECT" -o jsonpath='{.spec.storageClassName}')
     [[ $STORED_CLASS == "$STORAGE_CLASS" ]] || { echo "Existing PVC storage class differs; use its class or a new project" >&2; exit 1; }
+    oc annotate pvc model-pvc -n "$PROJECT" "demo.vllm/placement=$PLACEMENT" --overwrite
 else
     if oc get job download-model -n "$PROJECT" &>/dev/null; then
         echo "Download Job exists without its PVC; use a new project. No data was changed." >&2
@@ -97,6 +94,7 @@ metadata:
   annotations:
     demo.vllm/model-id: ${MODEL_ID}
     demo.vllm/model-revision: ${MODEL_REVISION}
+    demo.vllm/placement: ${PLACEMENT_ANNOTATION}
 spec:
   storageClassName: ${STORAGE_CLASS}
   accessModes:
@@ -131,7 +129,7 @@ if oc get job download-model -n "$PROJECT" &>/dev/null; then
     if [ "$JOB_STATUS" = "1" ]; then
         printf "✅ Model ${GREEN}already downloaded${NC}\n"
         printf "\n✅ ${GREEN}Setup complete!${NC}\n"
-        printf "   Next: ./02-deploy-runtime.sh %s, then apply 03-inference-service.yaml\n\n" "$PROJECT"
+        printf "   Next: ./02-deploy-runtime.sh %s, then ./03-deploy-model.sh %s\n\n" "$PROJECT" "$PROJECT"
         exit 0
     else
         printf "➡️ Existing download job found; waiting without interrupting it...\n"
@@ -168,11 +166,8 @@ spec:
   template:
     spec:
       nodeSelector:
-        ${STORAGE_KEY}: ${STORAGE_VALUE}
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
+        ${NODE_SELECTOR}
+      tolerations: ${TOLERATIONS}
       containers:
         - name: downloader
           image: ${DOWNLOAD_IMAGE}
@@ -221,5 +216,5 @@ printf "\n✅ ${GREEN}Setup complete!${NC}\n"
 printf "   Model downloaded to PVC ${YELLOW}model-pvc${NC}\n"
 printf "   Next steps:\n"
 printf "     1. ./02-deploy-runtime.sh %s\n" "$PROJECT"
-printf "     2. oc apply -f 03-inference-service.yaml\n"
+printf "     2. ./03-deploy-model.sh %s\n" "$PROJECT"
 printf "     3. ./04-run-inference.sh\n\n"

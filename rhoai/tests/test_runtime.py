@@ -23,7 +23,7 @@ class RuntimeTests(unittest.TestCase):
             template = {"objects": [{"kind": "ServingRuntime", "spec": {"containers": [
                 {"name": "sidecar", "image": "sidecar:keep"},
                 {"name": "kserve-container", "image": IMAGE}]}}]}
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix='lab, runtime ') as directory:
             folder = Path(directory)
             for name in ("02-deploy-runtime.sh", "02-serving-runtime.yaml", "00-run-lab.sh"):
                 if (ROOT / name).exists():
@@ -31,6 +31,7 @@ class RuntimeTests(unittest.TestCase):
             (folder / "01-setup-project.sh").write_text(
                 '#!/bin/bash\noc label namespace "$1" fixture=setup\n')
             (folder / "04-run-inference.sh").write_text("#!/bin/bash\nexit 0\n")
+            (folder / "03-deploy-model.sh").write_text("#!/bin/bash\nexit 0\n")
             (folder / "template.json").write_text(json.dumps(template))
             # Return the local manifest with a sidecar first: only the named
             # model container may change, never the first container by position.
@@ -50,6 +51,7 @@ if args[:2] == ['get', 'template']:
     if os.environ.get('FAIL_TEMPLATE') == '1': sys.exit('template lookup failed')
     print((root / 'template.json').read_text())
 elif args[:2] == ['create', '--dry-run=client']:
+    if ',' in args[args.index('-f') + 1]: sys.exit('oc treats comma-separated filenames as multiple paths')
     manifest = json.loads((root / 'manifest.json').read_text())
     manifest['metadata'].setdefault('namespace', namespace)
     print(json.dumps(manifest))

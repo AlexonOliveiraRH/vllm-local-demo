@@ -26,11 +26,16 @@ else
 fi
 bash "$SCRIPT_DIR/01-setup-project.sh" "$PROJECT"
 bash "$SCRIPT_DIR/02-deploy-runtime.sh" "$PROJECT"
-oc apply -n "$PROJECT" -f "$SCRIPT_DIR/03-inference-service.yaml"
+bash "$SCRIPT_DIR/03-deploy-model.sh" "$PROJECT"
 oc wait -n "$PROJECT" --for=condition=Ready inferenceservice/qwen25-3b --timeout="${READY_TIMEOUT:-1200s}"
+if [[ $ACTION == verify ]]; then
+    export MAX_TOKENS=${MAX_TOKENS:-32} IGNORE_EOS=${IGNORE_EOS:-1} STREAM=1
+fi
 bash "$SCRIPT_DIR/04-run-inference.sh" single
 if [[ $ACTION == verify ]]; then
-    bash "$SCRIPT_DIR/04-run-inference.sh" benchmark 4 12
+    for concurrency in 1 4 8; do
+        bash "$SCRIPT_DIR/04-run-inference.sh" benchmark "$concurrency" 12
+    done
     bash "$SCRIPT_DIR/04-run-inference.sh" metrics
     bash "$SCRIPT_DIR/04-run-inference.sh" prefix
     printf 'y\n' | bash "$SCRIPT_DIR/05-cleanup.sh" "$PROJECT"

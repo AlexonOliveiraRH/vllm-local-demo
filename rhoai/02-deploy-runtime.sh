@@ -37,7 +37,8 @@ fi
 export VLLM_IMAGE RESOLVED_RUNTIME_VERSION
 # Validate and materialize the whole manifest before any apply. Never edit YAML
 # in place, assume container order, or fall back silently to the example digest.
-RUNTIME_JSON=$(oc create --dry-run=client -n "$PROJECT" -f "$SCRIPT_DIR/02-serving-runtime.yaml" -o json |
+LOCAL_RUNTIME=$(oc create --dry-run=client -n "$PROJECT" -f - -o json < "$SCRIPT_DIR/02-serving-runtime.yaml")
+RUNTIME_JSON=$(printf '%s\n' "$LOCAL_RUNTIME" |
     python3 -c '
 import json, os, sys
 image = os.environ["VLLM_IMAGE"]

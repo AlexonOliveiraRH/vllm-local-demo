@@ -17,12 +17,20 @@ class SetupTests(unittest.TestCase):
 echo "$*" >> "$AUDIT_CALLS"
 case "$1 $2" in
  'whoami ') echo audit-user;;
- 'get nodes') echo audit-zone;;
+ 'get nodes') echo '{"items":[{"metadata":{"name":"gpu-a","labels":{"kubernetes.io/hostname":"gpu-a","nvidia.com/gpu.present":"true","nvidia.com/gpu.compute.major":"8","nvidia.com/gpu.compute.minor":"9"}},"spec":{},"status":{"allocatable":{"nvidia.com/gpu":"1"},"conditions":[{"type":"Ready","status":"True"}]}}]}';;
+ 'get pods') echo '{"items":[]}';;
+ 'create --dry-run=client') echo '{"spec":{"predictor":{"model":{"resources":{"requests":{"nvidia.com/gpu":"1"},"limits":{"nvidia.com/gpu":"1"}}}}}}';;
  'get storageclass')
-   if [[ "$*" == *jsonpath* ]]; then
-     if [[ "$SCENARIO" == immediate ]]; then echo Immediate; else echo WaitForFirstConsumer; fi
+   if [[ "$3" == test-sc ]]; then
+     if [[ "$SCENARIO" == immediate ]]; then mode=Immediate; else mode=WaitForFirstConsumer; fi
+     echo "{\\"metadata\\":{\\"name\\":\\"test-sc\\"},\\"volumeBindingMode\\":\\"$mode\\"}"
    else echo '{"items":[{"metadata":{"name":"test-sc","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}]}'; fi;;
  'get pvc')
+   if [[ "$*" == *'--ignore-not-found'* ]]; then
+     [[ "$SCENARIO" == missing-pvc ]] && exit 0
+     python3 -c 'import json,os; p={"metadata":{"uid":"current-pvc","annotations":{"demo.vllm/model-id":"Qwen/Qwen2.5-3B-Instruct","demo.vllm/model-revision":"aa8e72537993ba99e69dfaafa59ed015b17504d1"}},"spec":{"storageClassName":"test-sc"}}; a=p["metadata"]["annotations"]; a["demo.vllm/placement"]=json.dumps({"version":1,"nodeSelector":{"kubernetes.io/hostname":"gpu-a"},"tolerations":[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}],"storageClass":"test-sc","storageTopology":"auto"}); a.pop("demo.vllm/placement",None) if os.environ["SCENARIO"]=="legacy-pending" else None; a.update({"volume.kubernetes.io/selected-node":"other-gpu"}) if os.environ["SCENARIO"]=="legacy-pending" else None; print(json.dumps(p))'
+     exit 0
+   fi
    [[ "$SCENARIO" == missing-pvc ]] && exit 1
    [[ "$*" == *model-id* ]] && echo Qwen/Qwen2.5-3B-Instruct
    [[ "$*" == *model-revision* ]] && echo aa8e72537993ba99e69dfaafa59ed015b17504d1
@@ -36,7 +44,7 @@ case "$1 $2" in
      if [[ "$SCENARIO" == stale-job ]]; then echo old-pvc; else echo current-pvc; fi
    fi;;
  'apply -f') cat >/dev/null;;
- 'get project'|'project audit-project'|'label namespace') ;;
+ 'get project'|'project audit-project'|'label namespace'|'annotate pvc') ;;
  *) echo "Unexpected fixture command: $*" >&2; exit 99;;
 esac
 exit 0
@@ -70,6 +78,13 @@ exit 0
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("already downloaded", run.stdout)
         self.assertNotIn("delete job", calls)
+
+    def test_legacy_pending_pvc_is_not_assigned_a_different_placement(self):
+        run, calls = self.run_setup('legacy-pending')
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('new project', run.stderr)
+        self.assertNotIn('annotate pvc', calls)
+        self.assertNotIn('apply -f', calls)
 
 
 if __name__ == "__main__":

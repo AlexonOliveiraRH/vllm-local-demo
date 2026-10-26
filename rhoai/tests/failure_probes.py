@@ -72,13 +72,19 @@ def main():
             "oc": '''#!/bin/bash
 case "$1 $2" in
   'whoami ') echo audit-user; exit 0;;
-  'get nodes') echo test-zone; exit 0;;
+  'get nodes') echo '{"items":[{"metadata":{"name":"gpu-a","labels":{"kubernetes.io/hostname":"gpu-a","nvidia.com/gpu.present":"true","nvidia.com/gpu.compute.major":"8","nvidia.com/gpu.compute.minor":"9"}},"spec":{},"status":{"allocatable":{"nvidia.com/gpu":"1"},"conditions":[{"type":"Ready","status":"True"}]}}]}'; exit 0;;
+  'get pods') echo '{"items":[]}'; exit 0;;
+  'create --dry-run=client') echo '{"spec":{"predictor":{"model":{"resources":{"requests":{"nvidia.com/gpu":"1"},"limits":{"nvidia.com/gpu":"1"}}}}}}'; exit 0;;
   'get storageclass')
-    if [[ "$*" == *jsonpath* ]]; then echo WaitForFirstConsumer
+    if [[ "$3" == test-sc ]]; then echo '{"metadata":{"name":"test-sc"},"volumeBindingMode":"WaitForFirstConsumer"}'
     else echo '{"items":[{"metadata":{"name":"test-sc","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}]}'; fi
     exit 0;;
   'get pod') echo pod/qwen25-3b-audit-fixture; exit 0;;
   'get pvc')
+    if [[ "$*" == *'--ignore-not-found'* ]]; then
+      python3 -c 'import json;print(json.dumps({"metadata":{"annotations":{"demo.vllm/placement":json.dumps({"version":1,"nodeSelector":{"kubernetes.io/hostname":"gpu-a"},"tolerations":[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}],"storageClass":"test-sc","storageTopology":"auto"})}},"spec":{"storageClassName":"test-sc"}}))'
+      exit 0
+    fi
     [[ "$*" == *model-id* ]] && echo Qwen/Qwen2.5-3B-Instruct
     [[ "$*" == *model-revision* ]] && echo aa8e72537993ba99e69dfaafa59ed015b17504d1
     exit 0;;

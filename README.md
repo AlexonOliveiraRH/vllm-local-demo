@@ -26,6 +26,8 @@ vllm-local-demo/
 │   ├── 02-deploy-runtime.sh        # Resolve installed image and deploy runtime
 │   ├── 02-serving-runtime.yaml     # vLLM CUDA ServingRuntime for KServe
 │   ├── 03-inference-service.yaml   # InferenceService with GPU (RawDeployment)
+│   ├── 03-deploy-model.sh          # Apply the model with resolved GPU placement
+│   ├── placement.py               # Configurable GPU and storage placement
 │   ├── 04-run-inference.sh         # Validated inference, benchmark, metrics, prefix
 │   ├── inference_client.py        # Token counts, timing and per-request evidence
 │   ├── 05-cleanup.sh               # Remove all resources
