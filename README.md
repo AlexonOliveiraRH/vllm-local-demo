@@ -28,10 +28,10 @@ vllm-local-demo/
 │   ├── 03-inference-service.yaml   # InferenceService with GPU (RawDeployment)
 │   ├── 03-deploy-model.sh          # Apply the model with resolved GPU placement
 │   ├── placement.py               # Configurable GPU and storage placement
-│   ├── 04-run-inference.sh         # Validated inference, benchmark, metrics, prefix
-│   ├── inference_client.py        # Token counts, timing and per-request evidence
+│   ├── 04-run-inference.sh         # Inference, benchmark, metrics, prefix-cache test
+│   ├── inference_client.py        # Response validation, timing and JSON results
 │   ├── 05-cleanup.sh               # Remove all resources
-│   ├── tests/                     # Isolated HTTP and command regression tests
+│   ├── tests/                     # Local tests (no cluster needed)
 │   └── README.md                   # RHOAI-specific documentation
 ├── llamacpp-bench.sh               # llama.cpp server benchmark script
 └── README.md
@@ -359,12 +359,10 @@ With either server running:
 
 All tests used identical request parameters (prompt: *"Being an IT professional is"*, max 30 tokens, stop on `.`). Local tests ran on the same machine (CPU-only, no NVIDIA GPU). The RHOAI tests ran on an OpenShift cluster in AWS with a Tesla T4 GPU.
 
-**Historical exploratory results, not a controlled engine comparison.** These
-tables used different hardware, precisions, runtime versions, and serving paths.
-The original timing-only harness did not retain HTTP status, response validity,
-or actual output-token counts for each request. Treat the values as recorded
-observations, not verified successful-throughput or causal performance evidence.
-Use the failure-aware [`rhoai/`](rhoai/) workflow for new measurements.
+> **Note:** These are exploratory results. The runs used different hardware,
+> precisions, runtime versions, and serving paths, so they compare complete setups
+> rather than engines. For new measurements, use the [`rhoai/`](rhoai/) workflow,
+> which validates every response and records actual token counts.
 
 ### Gemma-3-270m Results (10 concurrent, 50 requests)
 
@@ -383,18 +381,16 @@ Use the failure-aware [`rhoai/`](rhoai/) workflow for new measurements.
 
 ### Qwen2.5-3B-Instruct Results (10 concurrent, 50 requests)
 
-The exploratory benchmark also used **[Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)** (3.09B parameters, 5.8 GiB in FP16). Hardware and serving configuration differed between the following runs:
+The same benchmark with **[Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)** (3.09B parameters, 5.8 GiB in FP16):
 
 | # | Runtime | Precision | Hardware | Cores | Throughput | Wall Clock | Latency (min/max) |
 |---|---------|-----------|----------|-------|------------|------------|-------------------|
 | 1 | **vLLM** (RHOAI GPU) | FP16 | **Tesla T4 16GB** | 4 + GPU | **8.6 req/s** | **5.76s** | **0.60s / 1.37s** |
 | 2 | **llama.cpp pure** (b8892) | F16 | CPU (bare metal) | 4 | 1.0 req/s | 47.63s | 3.52s / 4.94s |
 
-The recorded wall times differ by about 8.3x (47.63 / 5.76). Dividing the displayed,
-truncated request rates gives a different ratio and should not be used as an
-independent speedup measurement. These runs compare complete configurations, not
-the engines on matched hardware. They do not isolate the effect of model size,
-PagedAttention, or continuous batching.
+vLLM on a Tesla T4 finished the run about 8x faster than llama.cpp on four CPU
+cores. Because the hardware differs, this reflects the whole setup, not the
+engine alone.
 
 ### Key Takeaways
 
@@ -405,9 +401,6 @@ policy, and concurrency before attributing a difference to an engine feature.
 **Latency needs a distribution.** The recorded minimum and maximum are not enough
 to establish near-constant latency or an SLO. Retain successful request counts,
 p50/p95/p99, throughput, and repeated runs under a representative workload.
-
-The historical CPU configurations reported different timings; those observations
-need repetition with validated responses before drawing scaling conclusions.
 
 PagedAttention manages attention KV-cache blocks. Its usefulness depends on the
 serving workload; it is not limited to models whose weights exceed GPU memory,
@@ -437,18 +430,18 @@ and it does not guarantee freedom from out-of-memory errors.
 
 Several variables differ between these exploratory configurations:
 
-1. **Hardware and backend** - CPU and GPU execution use different builds and kernels. vLLM CPU installation is an explicit supported-backend choice, not a universal transparent CUDA fallback.
+1. **Hardware and backend** - CPU and GPU execution use different builds and kernels. Running vLLM on CPU requires a CPU build of the engine.
 
 2. **Transport and deployment** - Local Kubernetes, serverless, and direct
    serving can use different network paths. Verify the path for each run before
-   attributing latency to a gateway or activator. The current RHOAI lab forwards
-   directly to a Ready predictor Pod and does not benchmark an external route.
+   attributing latency to a gateway or activator. The RHOAI lab connects
+   directly to the predictor Pod, without an external route.
 
-3. **Model and request size** - Weight size, prompt length, generated-token count, and concurrency affect the balance of compute, memory, and scheduling costs. The measurements do not establish that the model fits in CPU hardware cache or that KV-cache management has no benefit.
+3. **Model and request size** - Weight size, prompt length, generated-token count, and concurrency affect the balance of compute, memory, and scheduling costs.
 
 4. **Kernel implementations** - Both projects have backend-specific optimizations. Attribute an observed difference to a particular kernel or overhead only with profiling evidence.
 
-5. **Version and launch settings** - The llama.cpp and ramalama runs used different builds and launch settings. Their separate contributions were not isolated.
+5. **Version and launch settings** - The llama.cpp and ramalama runs used different builds and launch settings.
 
 ### Where vLLM Shines
 
@@ -471,20 +464,16 @@ decoding. Compare the exact versions being deployed.
 CPU/GPU-hybrid workloads; vLLM with KServe is worth testing for managed,
 concurrent GPU serving. Neither is an exclusive category or an automatic winner.
 
-> **Note:** The historical GPU/CPU comparison does not establish how either
-> engine would perform on matched hardware, nor predict a speedup for larger
-> models. Use a controlled benchmark and quality evaluation for that decision.
-
 <img width="1536" height="1024" alt="Slide 11_2" src="https://github.com/user-attachments/assets/ea1bdd01-ecfd-40ba-b953-af28b55718a3" />
 
 ---
 
 ## Option C: Red Hat OpenShift AI (RHOAI) with GPU
 
-The [RHOAI lab](rhoai/README.md) uses KServe, a versioned vLLM runtime, and a
-PVC-backed Qwen2.5-3B-Instruct model. This is an educational GPU-serving lab, not
-a production security or capacity-planning reference. Model licenses and
-supported runtime/hardware combinations must be checked independently.
+The [RHOAI lab](rhoai/README.md) uses KServe, the vLLM runtime installed with
+OpenShift AI, and a PVC-backed Qwen2.5-3B-Instruct model. It's an educational
+GPU-serving lab, not a production reference. Check the model license and the
+supported runtime and hardware combinations for your release.
 
 ```bash
 cd rhoai/
@@ -496,12 +485,12 @@ STREAM=1 ./04-run-inference.sh benchmark 4 12
 ./04-run-inference.sh metrics
 ```
 
-The orchestrator resolves the installed runtime image and waits for model
-readiness. The client validates responses and records actual token counts.
-Non-streaming latency is not TTFT; use streaming for client-observed first-text
-timing. Compare throughput and latency on matched hardware and workloads.
+The orchestrator resolves the installed runtime image, picks a compatible GPU
+node, and waits for the model to be ready. The client validates responses and
+records actual token counts. Use streaming (`STREAM=1`) to measure time to first
+token.
 
-For a disposable end-to-end test, use a **new** project name:
+For a self-cleaning end-to-end test, use a **new** project name:
 
 ```bash
 ./00-run-lab.sh verify vllm-lifecycle-check
@@ -515,13 +504,12 @@ resources for inspection. For a retained lab, cleanup asks for confirmation:
 ./05-cleanup.sh vllm-demo
 ```
 
-See the [RHOAI instructions](rhoai/README.md) for storage topology, immutable
-model revisions, license terms, multi-GPU settings, measurement methodology,
-manual steps and troubleshooting. The historical Gemma/T4 observations above
-do not define the configuration or support scope of this workflow.
+See the [RHOAI instructions](rhoai/README.md) for GPU placement and storage
+options, license terms, multi-GPU settings, measurement methodology, manual steps,
+and troubleshooting.
 
-For the original Gemma/T4 setup, see the
-[historical appendix](#historical-appendix-gemma-3-270m-on-tesla-t4-with-rhoai).
+The earlier Gemma-3-270m on Tesla T4 setup is kept in the
+[appendix](#appendix-gemma-3-270m-on-tesla-t4-with-rhoai).
 
 ---
 
@@ -531,8 +519,8 @@ For the original Gemma/T4 setup, see the
 * **MicroShift (minc)** - Single-node OpenShift running as a Podman container, providing an OpenShift-compatible environment.
 * **KServe** - Kubernetes-native model serving platform that handles full model lifecycle, scaling, and routing.
 * **vLLM Backend** - Delivers fast, efficient inference with optimizations like KV cache memory management (PagedAttention), speculative decoding, and continuous batching.
-* **Gemma-3-270m** - The gated model used by the Kind/MicroShift examples and historical T4 appendix; requires authorized Hugging Face access.
-* **Qwen2.5-3B-Instruct** - The default model for the maintained [OpenShift AI lab](rhoai/README.md); review its separate model license and pinned revision there.
+* **Gemma-3-270m** - The gated model used by the Kind/MicroShift examples and the T4 appendix; requires authorized Hugging Face access.
+* **Qwen2.5-3B-Instruct** - The default model for the [OpenShift AI lab](rhoai/README.md); see its model license and pinned revision there.
 
 ---
 
@@ -623,24 +611,14 @@ The `VLLM_ATTENTION_BACKEND=CPU_ATTN` environment variable was used in older ver
 
 ---
 
-## Historical Appendix: Gemma-3-270m on Tesla T4 with RHOAI
+## Appendix: Gemma-3-270m on Tesla T4 with RHOAI
 
-> **Historical reference only.** This appendix records the Gemma-3-270m/Tesla T4
-> configuration from commit `edb8e72`, including the original upstream
-> `vllm/vllm-openai:v0.8.5` custom container. These instructions have not been
-> executed or retested as part of the current validation. That validation does
-> not establish compatibility or support for this historical configuration.
-> New users should start with the maintained [RHOAI workflow](rhoai/README.md)
-> in [`rhoai/`](rhoai/).
+> **Legacy setup, kept for reference.** It uses the upstream
+> `vllm/vllm-openai:v0.8.5` container directly instead of the OpenShift AI
+> runtime, and it isn't maintained against current releases. For new deployments,
+> use the [RHOAI lab](rhoai/README.md).
 
-The following five steps preserve the original project, PVC, download Job,
-InferenceService, request parameters, and legacy benchmark invocation for
-historical traceability. They are archival examples, not a currently validated
-deployment recipe. The custom-container predictor below does not select the
-`ServingRuntime` used by the maintained workflow. Credentials are placeholders;
-filesystem paths in the manifests refer to locations inside the containers.
-
-### Historical prerequisites
+### Prerequisites
 
 - An RHOAI cluster with KServe and a Tesla T4 GPU available to the workload.
 - An installed, authenticated `oc` client and permission to create the resources.
@@ -656,13 +634,12 @@ oc new-project vllm-benchmark
 
 ### Step 2: Download the Model via a Job
 
-The original setup downloaded the model into a PVC using a separate Job with a
-mounted token Secret. It then disabled the serving Pod's storage initializer and
-mounted that PVC directly. This records the chosen download path; it does not
-imply that all RHOAI installations require this workaround.
+This setup downloads the model into a PVC with a separate Job that mounts a token
+Secret. The serving Pod then mounts that PVC directly, with KServe's storage
+initializer disabled.
 
 ```bash
-# Placeholder only; no credential is included in this example.
+# Replace <your_token> with your Hugging Face token.
 oc create secret generic huggingface-secret --from-literal=token='<your_token>'
 
 # Create PVC for model storage
@@ -729,20 +706,17 @@ spec:
   backoffLimit: 2
 EOF
 
-# Original manual observation of download completion
+# Wait for the download Job to complete
 oc get pods -w
 ```
 
-This example did not pin a model revision, the downloader image digest, or the
-`huggingface_hub` version. It did not select a storage class or GPU zone. Its
-resource settings therefore do not guarantee a reproducible download or
-compatible volume placement on another cluster. Watching Pods is not an
-automated check of Job success.
+This example doesn't pin the model revision, downloader image, or
+`huggingface_hub` version, and it uses the default storage class.
 
 ### Step 3: Deploy vLLM with GPU
 
-The historical InferenceService used RawDeployment and a directly specified
-vLLM 0.8.5 container, with FP16, eager execution, and one requested GPU:
+The InferenceService uses RawDeployment and the vLLM 0.8.5 container directly,
+with FP16, eager execution, and one GPU:
 
 ```bash
 cat <<'EOF' | oc apply -f -
@@ -796,23 +770,18 @@ spec:
 EOF
 ```
 
-| Historical setting | Interpretation and limitation |
-|--------------------|-------------------------------|
-| `vllm/vllm-openai:v0.8.5` | Original upstream custom-container image, not the installed RHOAI runtime selected by the maintained lab. Its model/runtime compatibility has not been revalidated. |
-| GPU toleration | Permits the matching taint; it does not select a Tesla T4, guarantee available capacity, or resolve PVC topology constraints. |
-| `--dtype=half` | Selects FP16 for the T4 configuration; automatic dtype selection must not be assumed to make a BF16 model compatible with T4. |
-| `--enforce-eager` | Disables CUDA-graph execution. It is not a general fix for Triton compilation or filesystem permissions. |
-| `HOME` and `TRITON_CACHE_DIR` | Point to writable locations inside the container; their actual permissions still depend on the image and cluster security configuration. |
-| Disabled storage initializer | Relies on the separate download Job and mounted PVC; it does not verify that the model download succeeded. |
+| Setting | Purpose |
+|---------|---------|
+| GPU toleration | Allows scheduling on nodes with the `nvidia.com/gpu` taint. |
+| `--dtype=half` | FP16, required on T4, which doesn't support BF16. |
+| `--enforce-eager` | Disables CUDA graphs. |
+| `HOME` and `TRITON_CACHE_DIR` | Writable locations for OpenShift's non-root containers. |
+| Disabled storage initializer | The model is already on the PVC from the download Job. |
 
 ### Step 4: Run the Benchmark
 
-The original sequence observed Pods, forwarded a predictor Pod to loopback, and
-sent a non-streaming completion request. The Pod selector and manual readiness
-step are retained as historical details, not current readiness guarantees.
-
 ```bash
-# Original manual readiness observation
+# Wait for the predictor Pod to be ready
 oc get pods -w
 
 # Port-forward to the pod
@@ -830,31 +799,17 @@ curl -s http://localhost:8080/v1/completions \
     "stop": ["."]
   }' | jq .
 
-# Original legacy harness invocation from the repository root
+# Benchmark, from the repository root
 ./llamacpp-bench.sh benchmark 10 50
 ```
 
-**Legacy timing-only harness limitations:** In benchmark mode, the original
-`llamacpp-bench.sh` discarded response bodies and recorded curl timing values
-without retaining HTTP status, validating completions, or counting actual output
-tokens per request. Failed requests could contribute to the displayed request
-rate. Its llama.cpp labels and `/props` probe did not verify which engine served
-the requests. Non-streaming time to first byte is not token-level TTFT, and
-`max_tokens: 30` with a stop string does not guarantee 30 generated tokens.
-
-These limitations apply to the [historical performance tables](#performance-comparison-vllm-vs-llamacpp).
-Different hardware, precisions, runtime versions, and serving paths prevent
-those results from isolating engine effects. The comparison does not prove
-vLLM or llama.cpp superiority, a model-size threshold for GPU benefits, or the
-causal effect of PagedAttention or continuous batching. Use the maintained
-[RHOAI measurement workflow](rhoai/README.md#measurement-and-a-practical-demo)
-for new experiments.
+`llamacpp-bench.sh` measures timing only: it doesn't check HTTP status or count
+generated tokens, so failed requests can inflate the request rate. For validated
+measurements, use the [RHOAI measurement workflow](rhoai/README.md#measurement-and-a-practical-demo).
 
 ### Step 5: Clean Up
 
-The original cleanup deleted the entire example project, including its
-namespaced resources. It did not manage the background port-forward process,
-which must be stopped separately.
+Delete the project, and stop the background port-forward separately:
 
 ```bash
 oc delete project vllm-benchmark
