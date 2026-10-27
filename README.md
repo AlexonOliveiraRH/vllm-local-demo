@@ -30,6 +30,7 @@ vllm-local-demo/
 │   ├── placement.py               # Configurable GPU and storage placement
 │   ├── 04-run-inference.sh         # Inference, benchmark, metrics, prefix-cache test
 │   ├── inference_client.py        # Response validation, timing and JSON results
+│   ├── demo-helpers.sh            # Output summaries and show_deployment (source it)
 │   ├── 05-cleanup.sh               # Remove all resources
 │   ├── tests/                     # Local tests (no cluster needed)
 │   └── README.md                   # RHOAI-specific documentation
