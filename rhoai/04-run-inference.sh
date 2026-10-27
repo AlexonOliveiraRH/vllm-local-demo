@@ -14,7 +14,8 @@ if [[ -z ${BASE_URL:-} ]]; then
     PROJECT=${PROJECT:-$(oc project -q)}
     INGRESS_PORT=${INGRESS_PORT:-8080}
     [[ $INGRESS_PORT =~ ^[0-9]+$ ]] && (( INGRESS_PORT > 0 && INGRESS_PORT <= 65535 )) || { echo "Invalid INGRESS_PORT" >&2; exit 2; }
-    oc wait -n "$PROJECT" --for=condition=Ready "inferenceservice/$MODEL_NAME" --timeout="${READY_TIMEOUT:-900s}"
+    # Keep stdout as pure JSON so results can be piped to tools such as jq.
+    oc wait -n "$PROJECT" --for=condition=Ready "inferenceservice/$MODEL_NAME" --timeout="${READY_TIMEOUT:-900s}" >&2
     POD=$(oc get pods -n "$PROJECT" -l "serving.kserve.io/inferenceservice=${MODEL_NAME}" -o json |
         python3 -c 'import json,sys; pods=json.load(sys.stdin)["items"]; ready=[p["metadata"]["name"] for p in pods if not p["metadata"].get("deletionTimestamp") and any(c["type"]=="Ready" and c["status"]=="True" for c in p.get("status",{}).get("conditions",[]))]; print(ready[0] if ready else "")')
     [[ -n $POD ]] || { echo "No Ready predictor Pod found" >&2; exit 1; }

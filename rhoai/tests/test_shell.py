@@ -25,6 +25,13 @@ class ShellTests(unittest.TestCase):
             self.assertFalse(intended_failure("mock_forbidden_cleanup", code, "", message))
         self.assertFalse(intended_failure("real_http_500_benchmark", 1, "{}", "HTTP 500"))
 
+    def test_readiness_wait_does_not_pollute_json_stdout(self):
+        script = (Path(__file__).resolve().parents[1] / "04-run-inference.sh").read_text()
+        wait_lines = [line for line in script.splitlines() if line.strip().startswith("oc wait")]
+        self.assertTrue(wait_lines)
+        for line in wait_lines:
+            self.assertTrue(line.rstrip().endswith(">&2"), line)
+
 
 if __name__ == "__main__":
     unittest.main()

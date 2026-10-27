@@ -36,7 +36,8 @@ when choosing your own stack.
 - An authenticated `oc` client matching your OpenShift release, Bash, Python 3.9+,
   and `curl`. Get the client from your console's **Command Line Tools** page or the
   [OpenShift CLI download instructions](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/cli_tools/openshift-cli-oc).
-  The scripts use only the Python standard library.
+  The scripts use only the Python standard library. [`jq`](https://jqlang.org/) is
+  optional, for the output summaries shown in [Reading the output](#reading-the-output).
 - Permissions to create projects and namespaced serving resources, plus read
   access to GPU nodes, Pods across namespaces (to check GPU allocation), storage
   classes, and the runtime template.
@@ -129,6 +130,88 @@ project. If a step fails, it exits nonzero and keeps the resources for inspectio
 By default, `verify` uses streaming, 32 completion tokens, EOS ignored, and 12
 measured requests per concurrency level, after two warmup requests. `MAX_TOKENS`
 and `IGNORE_EOS` override the first two. Keep the same settings when comparing runs.
+
+## Reading the output
+
+Each client mode prints one JSON document on stdout, so you can save it or pipe it
+to a tool such as [`jq`](https://jqlang.org/). The full output includes every
+request; for a quick read, these filters show only the fields that tell the story:
+
+```bash
+summary_single() { jq -c '{ok: "\(.summary.successful_requests)/\(.summary.attempted_requests)", tokens: .summary.output_tokens, latency_s: (.summary.latency_seconds.mean*100|round/100), tok_per_s: (.summary.output_tokens_per_second*10|round/10)}'; }
+summary_bench() { jq -c '{c: .configuration.concurrency, ok: "\(.summary.successful_requests)/\(.summary.attempted_requests)", tok_per_s: (.summary.output_tokens_per_second*10|round/10), e2e_s: (.summary.latency_seconds.mean*100|round/100), ttft_s: (.summary.ttft_seconds.mean*100|round/100), tpot_ms: (.summary.tpot_seconds.mean*1000|round)}'; }
+summary_prefix() { jq -c '{reuse: .cache_reuse_observed, prompt_tokens: .warm.prompt_tokens, cached_tokens: (.prefix_counter_delta.hits|floor), ttft_cold_s: (.cold.ttft_seconds*100|round/100), ttft_warm_s: (.warm.ttft_seconds*100|round/100), tpot_cold_ms: (.cold.tpot_seconds*1000|round), tpot_warm_ms: (.warm.tpot_seconds*1000|round)}'; }
+
+export MAX_TOKENS=32 IGNORE_EOS=1
+./04-run-inference.sh single | summary_single
+for c in 1 4 8; do STREAM=1 ./04-run-inference.sh benchmark "$c" 12 | summary_bench; done
+./04-run-inference.sh prefix | summary_prefix
+```
+
+The example values below come from one NVIDIA L4 with the default model. Your
+numbers will differ with the GPU, runtime build, and other workloads; compare the
+**relative** changes rather than the absolute values. Client timing also includes
+the local port-forward, which inflates absolute latency slightly.
+
+### 1. `single`: one request as a baseline
+
+```json
+{"ok":"1/1","tokens":32,"latency_s":1.28,"tok_per_s":25}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `summary.successful_requests` / `failed_requests` | The request succeeded: HTTP 200, a non-empty completion, and token usage reported. |
+| `summary.output_tokens` | Tokens actually generated. With `IGNORE_EOS=1`, the model always produces exactly `MAX_TOKENS`, so the text may stop mid-sentence. |
+| `summary.latency_seconds.mean` | How long one user waits for the complete answer. |
+| `summary.output_tokens_per_second` | Generation speed when the GPU serves a single request. |
+
+### 2. `benchmark`: many users sharing one GPU
+
+```json
+{"c":1,"ok":"12/12","tok_per_s":24.3,"e2e_s":1.32,"ttft_s":0.53,"tpot_ms":26}
+{"c":4,"ok":"12/12","tok_per_s":88.3,"e2e_s":1.4,"ttft_s":0.58,"tpot_ms":26}
+{"c":8,"ok":"12/12","tok_per_s":127.8,"e2e_s":1.46,"ttft_s":0.64,"tpot_ms":26}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `configuration.concurrency` | How many requests are in flight at the same time. |
+| `summary.successful_requests` | Check this first: throughput only counts successful requests. |
+| `summary.output_tokens_per_second` | Total tokens per second across all requests: the server's aggregate throughput. |
+| `summary.latency_seconds.mean` | Average time each request takes from start to finish (end-to-end, or E2E). |
+| `summary.ttft_seconds.mean` | Time to first token: how long until text starts arriving (requires `STREAM=1`). |
+| `summary.tpot_seconds.mean` | Time per output token for each request, after the first token. |
+
+**What it shows:** going from 1 to 8 concurrent requests, aggregate throughput grew
+about 5x while each request took only about 10% longer, and the per-token speed
+stayed the same. That's **continuous batching**: at every generation step, vLLM
+processes all active requests together, and new requests join as soon as there is
+room. Without batching, the eighth request would wait for the seven before it.
+
+Throughput and latency are a tradeoff. Raise concurrency until latency stops
+meeting your application's needs, rather than picking the highest throughput.
+
+### 3. `prefix`: reusing work for a repeated prompt
+
+```json
+{"reuse":true,"prompt_tokens":1960,"cached_tokens":1952,"ttft_cold_s":0.69,"ttft_warm_s":0.51,"tpot_cold_ms":26,"tpot_warm_ms":26}
+```
+
+The experiment sends the same long prompt twice: a `cold` request, then a `warm` one.
+
+| Field | Meaning |
+| --- | --- |
+| `cache_reuse_observed` | `true` when both requests succeeded and the server's prefix-cache counters increased. |
+| `warm.prompt_tokens` | The prompt length, like a long system prompt or a shared document. |
+| `prefix_counter_delta.hits` | Prompt tokens served from the cache during the experiment. Here, 1952 of the warm request's 1960 tokens. (`queries` counts the prompt tokens of both requests.) |
+| `cold.ttft_seconds` vs `warm.ttft_seconds` | The warm request starts answering sooner because vLLM skips recomputing the cached part of the prompt (the prefill). |
+| `cold.tpot_seconds` vs `warm.tpot_seconds` | Unchanged: prefix caching speeds up reading the prompt, not generating the answer. |
+
+**What it shows:** **prefix caching** reuses the attention state of a prompt prefix
+that the server has already processed. It helps most when many requests share a
+long beginning, such as system prompts, few-shot examples, or retrieved documents.
+Two requests show that reuse happened; they aren't a precise speedup measurement.
 
 ## Files and manual workflow
 
