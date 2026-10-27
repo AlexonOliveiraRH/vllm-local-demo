@@ -135,16 +135,13 @@ and `IGNORE_EOS` override the first two. Keep the same settings when comparing r
 
 The `single`, `benchmark`, and `prefix` modes each print one JSON document on
 stdout. The `metrics` mode prints a text snapshot of Prometheus metrics.
-For the JSON modes, these filters summarize the results with [`jq`](https://jqlang.org/).
-Enable `pipefail` in the Bash terminal so the pipeline reports a failure if either
-the inference command or `jq` fails:
+For the JSON modes, `demo-helpers.sh` provides filters that summarize the results
+with [`jq`](https://jqlang.org/). Load it into your Bash terminal with `source`
+(running it as a script has no effect on your shell). It also turns on `pipefail`,
+so a pipeline reports a failure if either the inference command or `jq` fails:
 
 ```bash
-set -o pipefail
-
-summary_single() { jq -c '{ok: "\(.summary.successful_requests)/\(.summary.attempted_requests)", tokens: .summary.output_tokens, latency_s: (.summary.latency_seconds.mean*100|round/100), tok_per_s: (.summary.output_tokens_per_second*10|round/10)}'; }
-summary_bench() { jq -c '{c: .configuration.concurrency, ok: "\(.summary.successful_requests)/\(.summary.attempted_requests)", tok_per_s: (.summary.output_tokens_per_second*10|round/10), e2e_s: (.summary.latency_seconds.mean*100|round/100), ttft_s: (.summary.ttft_seconds.mean*100|round/100), tpot_ms: (.summary.tpot_seconds.mean*1000|round)}'; }
-summary_prefix() { jq -c '{reuse: .cache_reuse_observed, prompt_tokens: .warm.prompt_tokens, cached_tokens: (.prefix_counter_delta.hits|floor), ttft_cold_s: (.cold.ttft_seconds*100|round/100), ttft_warm_s: (.warm.ttft_seconds*100|round/100), tpot_cold_ms: (.cold.tpot_seconds*1000|round), tpot_warm_ms: (.warm.tpot_seconds*1000|round)}'; }
+source ./demo-helpers.sh
 
 export MAX_TOKENS=32 IGNORE_EOS=1
 (
@@ -158,7 +155,8 @@ export MAX_TOKENS=32 IGNORE_EOS=1
 ```
 
 The subshell stops the sequence on a failed step while leaving your interactive
-terminal open. Keep `pipefail` enabled when running the commands individually.
+terminal open. The same file defines `show_deployment`, which prints the
+InferenceService, PVC, and predictor Pod status for the project in `PROJECT`.
 
 The example values below come from one NVIDIA L4 with the default model. Your
 numbers will differ with the GPU, runtime build, and other workloads; compare the
@@ -242,6 +240,7 @@ check the timing values before describing a latency improvement.
 - `placement.py`: validates overrides and selects a compatible GPU node.
 - `04-run-inference.sh`: waits for readiness, opens a port-forward, runs the client.
 - `inference_client.py`: response validation, streaming timing, JSON results.
+- `demo-helpers.sh`: interactive helpers to `source`: output summaries and `show_deployment`.
 - `05-cleanup.sh`: deletes the project after confirmation.
 - `tests/`: local tests; no cluster needed.
 
