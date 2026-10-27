@@ -361,8 +361,11 @@ All tests used identical request parameters (prompt: *"Being an IT professional 
 
 > **Note:** These are exploratory results. The runs used different hardware,
 > precisions, runtime versions, and serving paths, so they compare complete setups
-> rather than engines. For new measurements, use the [`rhoai/`](rhoai/) workflow,
-> which validates every response and records actual token counts.
+> rather than engines. They were collected with the repository's timing-only
+> scripts (`llamacpp-bench.sh` and the Kind and MicroShift `03-run-inference.sh`),
+> which don't check HTTP status or validate responses. For new
+> measurements, use the [`rhoai/`](rhoai/) workflow, which validates every response
+> and records actual token counts.
 
 ### Gemma-3-270m Results (10 concurrent, 50 requests)
 
