@@ -133,25 +133,37 @@ and `IGNORE_EOS` override the first two. Keep the same settings when comparing r
 
 ## Reading the output
 
-Each client mode prints one JSON document on stdout, so you can save it or pipe it
-to a tool such as [`jq`](https://jqlang.org/). The full output includes every
-request; for a quick read, these filters show only the fields that tell the story:
+The `single`, `benchmark`, and `prefix` modes each print one JSON document on
+stdout. The `metrics` mode prints a text snapshot of Prometheus metrics.
+For the JSON modes, these filters summarize the results with [`jq`](https://jqlang.org/).
+Enable `pipefail` in the Bash terminal so the pipeline reports a failure if either
+the inference command or `jq` fails:
 
 ```bash
+set -o pipefail
+
 summary_single() { jq -c '{ok: "\(.summary.successful_requests)/\(.summary.attempted_requests)", tokens: .summary.output_tokens, latency_s: (.summary.latency_seconds.mean*100|round/100), tok_per_s: (.summary.output_tokens_per_second*10|round/10)}'; }
 summary_bench() { jq -c '{c: .configuration.concurrency, ok: "\(.summary.successful_requests)/\(.summary.attempted_requests)", tok_per_s: (.summary.output_tokens_per_second*10|round/10), e2e_s: (.summary.latency_seconds.mean*100|round/100), ttft_s: (.summary.ttft_seconds.mean*100|round/100), tpot_ms: (.summary.tpot_seconds.mean*1000|round)}'; }
 summary_prefix() { jq -c '{reuse: .cache_reuse_observed, prompt_tokens: .warm.prompt_tokens, cached_tokens: (.prefix_counter_delta.hits|floor), ttft_cold_s: (.cold.ttft_seconds*100|round/100), ttft_warm_s: (.warm.ttft_seconds*100|round/100), tpot_cold_ms: (.cold.tpot_seconds*1000|round), tpot_warm_ms: (.warm.tpot_seconds*1000|round)}'; }
 
 export MAX_TOKENS=32 IGNORE_EOS=1
-./04-run-inference.sh single | summary_single
-for c in 1 4 8; do STREAM=1 ./04-run-inference.sh benchmark "$c" 12 | summary_bench; done
-./04-run-inference.sh prefix | summary_prefix
+(
+  set -e
+  ./04-run-inference.sh single | summary_single
+  for c in 1 4 8; do
+    STREAM=1 ./04-run-inference.sh benchmark "$c" 12 | summary_bench
+  done
+  ./04-run-inference.sh prefix | summary_prefix
+)
 ```
+
+The subshell stops the sequence on a failed step while leaving your interactive
+terminal open. Keep `pipefail` enabled when running the commands individually.
 
 The example values below come from one NVIDIA L4 with the default model. Your
 numbers will differ with the GPU, runtime build, and other workloads; compare the
 **relative** changes rather than the absolute values. Client timing also includes
-the local port-forward, which inflates absolute latency slightly.
+the local port-forward; keep the connection path consistent across comparisons.
 
 ### 1. `single`: one request as a baseline
 
@@ -183,11 +195,15 @@ the local port-forward, which inflates absolute latency slightly.
 | `summary.ttft_seconds.mean` | Time to first token: how long until text starts arriving (requires `STREAM=1`). |
 | `summary.tpot_seconds.mean` | Time per output token for each request, after the first token. |
 
-**What it shows:** going from 1 to 8 concurrent requests, aggregate throughput grew
-about 5x while each request took only about 10% longer, and the per-token speed
-stayed the same. That's **continuous batching**: at every generation step, vLLM
-processes all active requests together, and new requests join as soon as there is
-room. Without batching, the eighth request would wait for the seven before it.
+**What it shows:** in this example, going from 1 to 8 concurrent requests increased
+aggregate throughput about 5x while mean request latency rose about 10%. The
+reported per-token times stayed close: more requests were served at nearly the
+same per-request generation time.
+
+vLLM uses **continuous batching** to update the active batch between generation
+steps. As requests finish and capacity becomes available, new work can join.
+Compare your own throughput, latency, and TPOT values together when describing
+the result.
 
 Throughput and latency are a tradeoff. Raise concurrency until latency stops
 meeting your application's needs, rather than picking the highest throughput.
@@ -204,14 +220,16 @@ The experiment sends the same long prompt twice: a `cold` request, then a `warm`
 | --- | --- |
 | `cache_reuse_observed` | `true` when both requests succeeded and the server's prefix-cache counters increased. |
 | `warm.prompt_tokens` | The prompt length, like a long system prompt or a shared document. |
-| `prefix_counter_delta.hits` | Prompt tokens served from the cache during the experiment. Here, 1952 of the warm request's 1960 tokens. (`queries` counts the prompt tokens of both requests.) |
-| `cold.ttft_seconds` vs `warm.ttft_seconds` | The warm request starts answering sooner because vLLM skips recomputing the cached part of the prompt (the prefill). |
-| `cold.tpot_seconds` vs `warm.tpot_seconds` | Unchanged: prefix caching speeds up reading the prompt, not generating the answer. |
+| `prefix_counter_delta.hits` | Increase in the server-wide cached prompt-token count during the experiment. Here, 1952 cache hits were observed with a 1960-token prompt. |
+| `cold.ttft_seconds` vs `warm.ttft_seconds` | Compare when text first arrived in each request. Prefix reuse reduces prefill work; the observed warm TTFT can still vary with scheduling and transport. |
+| `cold.tpot_seconds` vs `warm.tpot_seconds` | Compare the observed per-token generation times. Prefix caching reuses prompt state; decoding still generates the new answer tokens. |
 
 **What it shows:** **prefix caching** reuses the attention state of a prompt prefix
 that the server has already processed. It helps most when many requests share a
 long beginning, such as system prompts, few-shot examples, or retrieved documents.
-Two requests show that reuse happened; they aren't a precise speedup measurement.
+Run the experiment without other traffic to the predictor because the counters
+are shared. A positive cache-hit delta confirms observed reuse during the pair;
+check the timing values before describing a latency improvement.
 
 ## Files and manual workflow
 
