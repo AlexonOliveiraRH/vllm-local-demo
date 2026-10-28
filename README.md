@@ -336,11 +336,21 @@ cmake --build build --config Release -j$(nproc)
 ./build/bin/llama-server \
     -m /path/to/gemma-3-270m-it-F16.gguf \
     --host 0.0.0.0 --port 8080 \
-    -t 4 \          # threads
-    -np 4 \         # parallel slots (concurrent requests)
-    -c 4096 \       # total context size
-    --no-mmap
+    -t 4 \
+    -np 4 \
+    -c 4096 \
+    --load-mode none
 ```
+
+- `-t 4` - CPU threads used for generation
+- `-np 4` - parallel slots, the number of requests processed concurrently
+- `-c 4096` - total context size, shared across the slots (1024 tokens per slot here)
+- `--load-mode none` - load the model into memory without memory-mapping it.
+  Older llama.cpp builds use `--no-mmap` instead; run `./build/bin/llama-server --help`
+  to see which option your build supports.
+
+Keep comments out of the multi-line command: a `\` followed by a comment no longer
+continues the line, so the remaining options would run as separate commands.
 
 ### Run the Benchmark
 
