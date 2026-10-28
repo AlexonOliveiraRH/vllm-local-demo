@@ -480,6 +480,107 @@ concurrent GPU serving. Neither is an exclusive category or an automatic winner.
 
 <img width="1536" height="1024" alt="Slide 11_2" src="https://github.com/user-attachments/assets/ea1bdd01-ecfd-40ba-b953-af28b55718a3" />
 
+### Feature behavior: the same mechanisms in llama.cpp
+
+vLLM's main serving features have counterparts in the llama.cpp server. Because
+llama.cpp lets you turn most of them off, you can measure what each one
+contributes, even on a CPU. These experiments use the same model as the
+[RHOAI lab](rhoai/README.md) and the same request protocol as its client, so the
+behavior is comparable with the vLLM measurements there. The absolute numbers are
+not: one side runs on a laptop CPU, the other on a GPU.
+
+| vLLM | llama.cpp server option | Difference |
+|------|-------------------------|------------|
+| Continuous batching (always on) | `--cont-batching` (default) or `--no-cont-batching` | Can be turned off to measure its effect |
+| `--max-num-seqs` | `-np`, the number of slots | Similar role: caps the requests processed together |
+| PagedAttention: a shared, block-based KV cache | `--kv-unified`: one KV buffer shared by all sequences | Shared, but not paged in blocks. Off by default when `-np` is set, so each slot gets a fixed share (`-c` ÷ `-np`) |
+| Automatic prefix caching (global, block-based) | `--cache-prompt` (default), `--slot-prompt-similarity`, `--cache-ram` | Reuse happens per slot. Each response reports `usage.prompt_tokens_details.cached_tokens` |
+
+**Setup:** llama.cpp b11969 CPU build (`-DGGML_VULKAN=OFF -DGGML_CPU=ON`) with 4
+threads on an Intel Core Ultra 7 165H laptop; Qwen2.5-3B-Instruct as F16 GGUF;
+the `rhoai/` client with streaming, 32 forced output tokens, 12 measured requests
+per level, and 2 warmups. Restart the server before each experiment so every run
+starts with an empty cache.
+
+```bash
+# Model: about 6.8 GB in two files
+hf download Qwen/Qwen2.5-3B-Instruct-GGUF --include "qwen2.5-3b-instruct-fp16-*.gguf" --local-dir models
+
+# Server: base options; add each experiment's options from the tables below
+./build/bin/llama-server -m models/qwen2.5-3b-instruct-fp16-00001-of-00002.gguf \
+    --host 127.0.0.1 --port 8081 -t 4 -np 4 -c 4096
+
+# Client, from the rhoai/ directory
+source ./demo-helpers.sh
+export BASE_URL=http://127.0.0.1:8081 MAX_TOKENS=32 IGNORE_EOS=1
+for c in 1 4 8; do STREAM=1 ./04-run-inference.sh benchmark "$c" 12 | summary_bench; done
+```
+
+The client's `prefix` mode reads vLLM metrics, so experiments C and D send a long
+prompt (about 2,000 tokens) twice and read llama.cpp's per-request cache report:
+
+```bash
+PROMPT="$(printf 'The service receives concurrent requests and reuses attention state for matching prompt prefixes. %.0s' $(seq 1 128))"
+for run in cold warm; do
+  curl -s http://127.0.0.1:8081/v1/completions -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg p "$PROMPT" '{prompt: $p, max_tokens: 32, temperature: 0, ignore_eos: true}')" |
+    jq -c --arg run "$run" '{run: $run, prompt_tokens: .usage.prompt_tokens, cached_tokens: .usage.prompt_tokens_details.cached_tokens, prefill_ms: .timings.prompt_ms, decode_ms_per_token: .timings.predicted_per_token_ms, error: .error.message}'
+done
+```
+
+**A. Continuous batching** (`-np 4 -c 4096`, with and without `--no-cont-batching`)
+
+| Concurrency | On: tok/s · E2E · TTFT | Off: tok/s · E2E · TTFT |
+|-------------|------------------------|-------------------------|
+| 1 | 6.5 · 4.94 s · 0.16 s | 6.4 · 5.02 s · 0.16 s |
+| 4 | **23.4 · 5.44 s · 0.38 s** | 13.4 · 9.16 s · 4.78 s |
+| 8 | **23.9 · 8.93 s · 3.81 s** | 19.5 · 10.86 s · 6.07 s |
+
+With one request at a time, it makes no difference. With four, turning it off
+nearly halved throughput and made the first token arrive about 12 times later,
+because new requests wait for the current batch to finish.
+
+**B. Slots, the `--max-num-seqs` counterpart** (concurrency 8; `-c` scaled so each slot keeps 1,024 tokens)
+
+| Server options | tok/s | E2E | TTFT | Time per token |
+|----------------|-------|-----|------|----------------|
+| `-np 4 -c 4096` | 23.9 | 8.99 s | 3.99 s | 161 ms |
+| `-np 8 -c 8192` | **27.5** | **7.46 s** | **1.15 s** | 204 ms |
+
+With 8 slots, no request waits in the queue, so the first token arrives sooner and
+total throughput rises. Each token comes out more slowly, because the CPU shares
+its work across more active requests: the same tradeoff as tuning
+`--max-num-seqs` in vLLM.
+
+**C. Per-slot vs. shared KV cache** (`-np 4 -c 4096`, prompt of about 2,000 tokens)
+
+| Server options | KV space per request | Result |
+|----------------|----------------------|--------|
+| `--no-kv-unified` (default with `-np`) | 1,024 tokens, fixed per slot | Rejected: HTTP 400, "request (1969 tokens) exceeds the available context size (1024 tokens)" |
+| `--kv-unified` | Up to the shared 4,096-token pool | Accepted |
+
+The same total memory either rejected or served the request, depending on whether
+it was split into fixed shares or shared. That's the fragmentation problem that
+PagedAttention addresses in vLLM, where the shared pool needs no extra option.
+
+**D. Prompt caching** (`-np 4 -c 4096 --kv-unified`, with and without `--no-cache-prompt`)
+
+| Cache | Run | Prompt tokens · cached | Prompt processing | E2E | Time per token |
+|-------|-----|------------------------|-------------------|-----|----------------|
+| On (default) | Cold | 1,965 · 0 | 37.0 s | 42.2 s | 168 ms |
+| On (default) | Warm | 1,965 · **1,964** | **0.17 s** | **5.4 s** | 167 ms |
+| Off | Cold | 1,972 · 0 | 37.5 s | 43.2 s | 183 ms |
+| Off | Warm | 1,972 · 0 | 38.4 s | 43.8 s | 173 ms |
+
+On a CPU, processing a long prompt is expensive, so reusing the cached prefix made
+the second response about 8 times faster. Time per token stayed about the same:
+the cache speeds up reading the prompt, not generating the answer.
+
+> **Note:** These are single runs with small samples on a laptop CPU. They show how
+> each mechanism changes behavior; they don't rank llama.cpp against vLLM. That
+> comparison needs the same model, precision, hardware, and request protocol, for
+> example a CUDA build of llama.cpp on the same GPU as the vLLM runtime.
+
 ---
 
 ## Option C: Red Hat OpenShift AI (RHOAI) with GPU
